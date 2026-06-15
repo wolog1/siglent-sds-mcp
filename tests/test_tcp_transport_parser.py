@@ -14,7 +14,7 @@ def test_ieee4882_binary_block_parser_with_socketpair() -> None:
     def responder() -> None:
         try:
             _ = server.recv(1024)
-            server.sendall(b"#500004hello")
+            server.sendall(b"#500005hello\n")
         finally:
             server.close()
 
@@ -23,7 +23,30 @@ def test_ieee4882_binary_block_parser_with_socketpair() -> None:
     try:
         block = transport.query_binary("C1:WF? DAT2")
         assert block.framing == "ieee4882"
-        assert block.data == b"hell"
+        assert block.data == b"hello"
+    finally:
+        client.close()
+        thread.join(timeout=1)
+
+
+def test_ieee4882_parser_skips_ascii_prefix() -> None:
+    client, server = socket.socketpair()
+    transport = RawTcpTransport("127.0.0.1")
+    transport._socket = client  # noqa: SLF001 - unit test injects socketpair
+
+    def responder() -> None:
+        try:
+            _ = server.recv(1024)
+            server.sendall(b"C1:WF DAT2,#500004abcd\n")
+        finally:
+            server.close()
+
+    thread = threading.Thread(target=responder)
+    thread.start()
+    try:
+        block = transport.query_binary("C1:WF? DAT2")
+        assert block.framing == "ieee4882"
+        assert block.data == b"abcd"
     finally:
         client.close()
         thread.join(timeout=1)
