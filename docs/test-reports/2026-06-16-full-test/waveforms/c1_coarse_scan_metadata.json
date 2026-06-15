@@ -1,0 +1,56 @@
+{
+  "channel": "C1",
+  "commands": {
+    "vdiv": "C1:VDIV?",
+    "offset": "C1:OFST?",
+    "timebase": "TDIV?",
+    "sample_rate": "SARA?",
+    "waveform_setup": "WFSU SP,1,NP,0,FP,0",
+    "waveform_desc": "C1:WF? DESC",
+    "waveform_query": "C1:WF? DAT2"
+  },
+  "raw_responses": {
+    "vdiv": "1.00E+00",
+    "offset": "0.00E+00",
+    "timebase": "1.00E-03",
+    "sample_rate": "5.00E+08"
+  },
+  "parsed": {
+    "vdiv_v": 1.0,
+    "offset_v": 0.0,
+    "timebase_s_per_div": 0.001,
+    "sample_rate_sps": 500000000.0,
+    "time_interval_s": 1.999999943436137e-09,
+    "start_time_s": 0.0
+  },
+  "wavedesc": {
+    "vertical_gain_vdiv": 0.10000000149011612,
+    "max_value": 7680.0,
+    "codes_per_div": 30.0,
+    "gain_v_per_code": 0.0033333333830038708,
+    "vertical_offset": 0.0,
+    "horiz_interval": 1.999999943436137e-09,
+    "horiz_offset": -0.0,
+    "wave_array_count": 5000000,
+    "raw_bytes": 346,
+    "source": "wavedesc"
+  },
+  "decode": {
+    "source": "fallback_codes_per_div__wavedesc_vdiv_mismatch",
+    "vertical_gain_v_per_code": 0.03333333333333333,
+    "vertical_offset_v": 0.0,
+    "time_source": "wavedesc",
+    "codes_per_div_fallback": 30,
+    "wavedesc_vdiv_mismatch": true
+  },
+  "binary": {
+    "bytes": 5000000,
+    "framing": "ieee4882"
+  },
+  "points": {
+    "total": 5000000,
+    "returned": 5000,
+    "decimation": "minmax_envelope"
+  },
+  "status": "candidate_implementation_requires_sds824xhd_validation"
+}
