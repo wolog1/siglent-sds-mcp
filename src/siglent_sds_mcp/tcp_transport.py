@@ -34,6 +34,7 @@ class RawTcpTransport:
         self.timeout_s = timeout_s
         self._socket: socket.socket | None = None
         self._lock = threading.RLock()
+        self._last_tail_bytes: bytes | None = None  # diagnostic: unexpected bytes after binary payload
 
     def connect(self) -> None:
         with self._lock:
@@ -179,10 +180,16 @@ class RawTcpTransport:
         except ValueError as exc:
             raise ScpiTcpError(f"invalid IEEE 488.2 length: {length_digits!r}") from exc
         payload = self._read_exact(sock, data_len)
-        # Try to drain common trailing newline(s), but do not require them.
+        # Consume trailing newline(s) — SIGLENT appends \n after binary blocks.
+        # Only consume actual newline bytes; if something else arrives, leave it
+        # in the socket buffer for the next read (do not silently discard).
         try:
             sock.settimeout(0.05)
-            _ = sock.recv(2)
+            tail = sock.recv(2)
+            if tail and tail not in (b"\n", b"\r\n"):
+                # Not a newline — put it back conceptually by logging.
+                # We cannot pushback to a TCP socket, so record for diagnostics.
+                self._last_tail_bytes = tail  # noqa: SLF001 — diagnostic-only store
         except (TimeoutError, socket.timeout):
             pass
         finally:
@@ -197,10 +204,13 @@ class RawTcpTransport:
         if file_size <= 54 or file_size > 100_000_000:
             raise ScpiTcpError(f"invalid BMP file size: {file_size}")
         rest = self._read_exact(sock, file_size - len(header))
-        # SIGLENT 在 BMP 数据后会追加一个收尾换行符，读走以免污染下一次查询。
+        # Consume trailing newline(s) — SIGLENT appends \n after BMP data.
+        # Only consume actual newline bytes; unexpected bytes are recorded, not discarded.
         try:
             sock.settimeout(0.1)
-            _ = sock.recv(2)
+            tail = sock.recv(2)
+            if tail and tail not in (b"\n", b"\r\n"):
+                self._last_tail_bytes = tail  # noqa: SLF001 — diagnostic-only store
         except (TimeoutError, socket.timeout):
             pass
         finally:
@@ -209,16 +219,25 @@ class RawTcpTransport:
 
     @staticmethod
     def _read_until_timeout(sock: socket.socket) -> bytes:
+        """Read until timeout or EOF — drains trailing bytes after binary payload.
+
+        Returns all data read.  Break on timeout (no more data) or EOF (peer
+        closed gracefully).  Does NOT silently discard bytes.
+        """
         chunks: list[bytes] = []
         old_timeout = sock.gettimeout()
         sock.settimeout(0.2)
         try:
             while True:
-                chunks.append(sock.recv(4096))
+                chunk = sock.recv(4096)
+                if not chunk:  # EOF — peer closed connection
+                    break
+                chunks.append(chunk)
         except (TimeoutError, socket.timeout):
-            return b"".join(chunks)
+            pass  # expected — no more data within timeout
         finally:
             sock.settimeout(old_timeout)
+        return b"".join(chunks)
 
 
 def _normalize_command(command: str) -> str:

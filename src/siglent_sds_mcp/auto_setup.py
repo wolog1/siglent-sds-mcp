@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
 from .artifacts import default_artifact_paths, ensure_parent, write_json
 from .sds_tcp_adapter import Channel, SDS800XHDTcpAdapter
@@ -79,11 +79,14 @@ class AutoSetupResult:
     recommended_timebase: str | None
     trigger_level: str | None
     probes: list[ChannelProbe] = field(default_factory=list)
+    coarse_stats: dict[str, object] | None = None
+    final_stats: dict[str, object] | None = None
     final_waveform_csv: str | None = None
     final_metadata_path: str | None = None
     screenshot_path: str | None = None
     report_json_path: str | None = None
     notes: list[str] = field(default_factory=list)
+    offset_direction_status: str = "needs_hardware_validation"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -96,11 +99,14 @@ class AutoSetupResult:
             "recommended_timebase": self.recommended_timebase,
             "trigger_level": self.trigger_level,
             "probes": [asdict(probe) for probe in self.probes],
+            "coarse_stats": self.coarse_stats,
+            "final_stats": self.final_stats,
             "final_waveform_csv": self.final_waveform_csv,
             "final_metadata_path": self.final_metadata_path,
             "screenshot_path": self.screenshot_path,
             "report_json_path": self.report_json_path,
             "notes": self.notes,
+            "offset_direction_status": self.offset_direction_status,
         }
 
 
@@ -208,13 +214,19 @@ def auto_find_waveform(
     recommended_timebase = choose_timebase(edge_interval, signal_hint=signal_hint)
     trigger_level = _format_volts(threshold if threshold is not None else (vmean or 0.0))
     confidence = _confidence(vpp=vpp, edge_count=edge_count, noise_floor_v=noise_floor_v)
+    coarse_stats = best.stats
 
     notes.append(f"Selected {best.channel}: Vpp={vpp:.6g} V, edges={edge_count}.")
     notes.append(f"Vertical setup: VDIV={recommended_vdiv}, OFST={recommended_offset}.")
     if recommended_timebase:
         notes.append(f"Timebase setup: TDIV={recommended_timebase}.")
     notes.append(f"Trigger level set near waveform midpoint: {trigger_level}.")
+    notes.append(
+        "offset_direction_status=needs_hardware_validation: "
+        "OFST=vmean assumes voltage = code*gain - offset; verify with 3.3V square wave on real scope."
+    )
 
+    # --- Apply final setup ---
     scope.configure_channel(
         channel=best.channel,
         vdiv=recommended_vdiv,
@@ -233,8 +245,31 @@ def auto_find_waveform(
     )
     time.sleep(settle_s)
 
-    final_wf = scope.get_waveform(channel=best.channel, max_points=max_points)
+    # --- Final capture: screenshot + waveform from the SAME STOP frame ---
+    # Sequence matters: STOP first, then screenshot, then waveform (without
+    # restoring TRMD in between), so the screenshot and CSV represent the
+    # exact same acquisition frame.  Only restore TRMD after both are saved.
+    scope.transport.write("STOP")
+    time.sleep(0.1)
+
     shot = scope.screenshot(default_artifact_paths("auto_find_waveform")["screenshot_raw"])
+
+    final_wf = scope.get_waveform(channel=best.channel, max_points=max_points, restore_trmd=False)
+    final_stats_raw = analyze_waveform_csv(final_wf.csv_path, noise_floor_v=noise_floor_v)
+    final_stats = final_stats_raw.to_dict()
+
+    # Verify the final waveform actually improved visibility.
+    final_vpp = _float_or_none(final_stats.get("v_pp"))
+    if final_vpp and final_vpp >= noise_floor_v:
+        notes.append(
+            f"Final waveform: Vpp={final_vpp:.6g} V, edges={final_stats.get('edge_count')}, "
+            f"visible after auto-setup."
+        )
+    else:
+        notes.append("Warning: final waveform still near noise floor after auto-setup.")
+
+    # Restore acquisition after all captures are done.
+    scope.transport.write("ARM")
 
     result = AutoSetupResult(
         found=True,
@@ -246,10 +281,13 @@ def auto_find_waveform(
         recommended_timebase=recommended_timebase,
         trigger_level=trigger_level,
         probes=probes,
+        coarse_stats=coarse_stats,
+        final_stats=final_stats,
         final_waveform_csv=final_wf.csv_path,
         final_metadata_path=final_wf.metadata_path,
         screenshot_path=str(shot.get("path")) if shot.get("path") else None,
         notes=notes,
+        offset_direction_status="needs_hardware_validation",
     )
     return _write_auto_result(result)
 

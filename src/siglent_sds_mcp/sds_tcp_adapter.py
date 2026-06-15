@@ -290,6 +290,8 @@ class SDS800XHDTcpAdapter:
         csv_path: str | Path | None = None,
         metadata_path: str | Path | None = None,
         max_points: int = 5000,
+        *,
+        restore_trmd: bool = True,
     ) -> WaveformResult:
         ch = _channel(channel)
         paths = default_artifact_paths(f"waveform_{ch.lower()}")
@@ -400,10 +402,11 @@ class SDS800XHDTcpAdapter:
 
         # --- 8. 恢复采集状态 ---
         # 波形读取完成后恢复之前的触发模式，避免 scope 一直停在 STOP。
-        try:
-            self.transport.write(f"TRMD {prev_trmd}")
-        except Exception:  # noqa: BLE001 - 尽力恢复，失败不影响波形数据
-            pass
+        if restore_trmd:
+            try:
+                self.transport.write(f"TRMD {prev_trmd}")
+            except Exception:  # noqa: BLE001 - 尽力恢复，失败不影响波形数据
+                pass
 
         # --- 9. 元数据 ---
         wavedesc_info: dict[str, Any] = (
