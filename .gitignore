@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# mypy / ruff cache
+.mypy_cache/
+.ruff_cache/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 临时脚本（调试/验证用，不纳入版本控制）
+auto_debug_waveform*.py
+capture_uart_2mbps.py
+quick_test.py
+restart_mcp.sh
+smart_waveform_capture.py
+test_waveform.sh
+waveform_display.py
+
+# 备份文件
+*.bak
+
+# 采集产物（大文件，使用时本地生成）
+artifacts/
+uart_*.csv
+uart_*.png
+verify_*.csv
+verify_*.json
+verify_*.png
+mcp_verify_*.csv
+mcp_verify_*.png
+cap*.png
+
+# 日志
+*.log
+
+# IDE
+.vscode/
+.idea/
