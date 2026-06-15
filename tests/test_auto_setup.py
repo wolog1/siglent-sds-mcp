@@ -4,8 +4,6 @@ from __future__ import annotations
 import pytest
 
 from siglent_sds_mcp.sds_tcp_adapter import (
-    _VDIV_STEPS_V,
-    _TDIV_STEPS_S,
     _pick_vdiv,
     _pick_tdiv,
     _parse_meas_value,
