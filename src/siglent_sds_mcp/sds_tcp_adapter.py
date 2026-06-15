@@ -474,6 +474,7 @@ class SDS800XHDTcpAdapter:
         # --- 1. 辅助查询（用于 fallback 解码及元数据记录）---
         vdiv_raw = self.transport.query(f"{ch}:VDIV?")
         ofst_raw = self.transport.query(f"{ch}:OFST?")
+        attn_raw = self.transport.query(f"{ch}:ATTN?")
         tdiv_raw = self.transport.query("TDIV?")
         sara_raw = self.transport.query("SARA?")
 
@@ -488,8 +489,12 @@ class SDS800XHDTcpAdapter:
         # 下不保证立即触发完成。正确做法：利用 AUTO 模式的自动触发，等待至少
         # 一帧完整采集后 STOP。
         prev_trmd = self.transport.query("TRMD?")
-        # 确保 AUTO 模式已运行并完成至少一帧采集。
-        self.transport.write("TRMD AUTO")
+        # 确保完成至少一帧在当前设置下的采集。
+        # 策略：切 SINGLE → ARM 强制触发 → 等待 sweep 时间 → STOP。
+        # 避免 AUTO 模式下 ARM 使仪器进入 Ready 但未触发即被 STOP 打断（DAT2=0）。
+        self.transport.write("TRMD SINGLE")
+        time.sleep(0.05)
+        self.transport.write("ARM")
         sweep_estimate = max(tdiv * 20.0, 0.2)  # 至少 200ms
         time.sleep(sweep_estimate)
         self.transport.write("STOP")
@@ -514,35 +519,29 @@ class SDS800XHDTcpAdapter:
         raw = block.data
         total_points = len(raw)
 
-        # --- 5. 电压解码：优先 WAVEDESC，fallback 到 CODES_PER_DIV 常量 ---
-        # WAVEDESC 解码：voltage = code × gain_v_per_code - VERTICAL_OFFSET
-        #   gain_v_per_code = VDIV / (MAX_VALUE / 256) = VDIV / codes_per_div
-        # Fallback 公式：voltage = code × (vdiv / CODES_PER_DIV) - offset
-        #
-        # 交叉验证：若 WAVEDESC 内嵌的 VERTICAL_GAIN 与当前 VDIV? 偏差超过 5%，
-        # 说明 WAVEDESC 来自旧采集设置，回退到 VDIV?/OFST? 解码。
-        wavedesc_vdiv_mismatch = False
-        if wavedesc is not None and wavedesc.gain_v_per_code != 0.0:
-            desc_vdiv = wavedesc.vertical_gain_vdiv
-            if vdiv > 0 and abs(desc_vdiv - vdiv) / vdiv > 0.05:
-                wavedesc_vdiv_mismatch = True
-                voltages = [_siglent_byte_to_voltage(byte, vdiv, offset) for byte in raw]
-                decode_source = "fallback_codes_per_div__wavedesc_vdiv_mismatch"
-                gain_used = vdiv / CODES_PER_DIV
-                offset_used = offset
-            else:
-                voltages = [
-                    _siglent_byte_to_voltage_gain(byte, wavedesc.gain_v_per_code, wavedesc.vertical_offset)
-                    for byte in raw
-                ]
-                decode_source = "wavedesc"
-                gain_used = wavedesc.gain_v_per_code
-                offset_used = wavedesc.vertical_offset
-        else:
-            voltages = [_siglent_byte_to_voltage(byte, vdiv, offset) for byte in raw]
-            decode_source = "fallback_codes_per_div"
-            gain_used = vdiv / CODES_PER_DIV
-            offset_used = offset
+        # --- 5. 电压解码 ---
+        # 策略：codes_per_div 从 WAVEDESC MAX_VALUE 自适应推导（型号无关），
+        # gain/offset 使用面板实时查询值（VDIV? / OFST?），避免 WAVEDESC
+        # VERTICAL_GAIN/VERTICAL_OFFSET 滞后于面板设置导致的解码偏差。
+        # 实测 SDS824X HD：切换 VDIV/OFST 后 WAVEDESC 缓存需额外 1~2 帧才更新。
+        codes_per_div = (
+            wavedesc.codes_per_div
+            if wavedesc is not None and wavedesc.codes_per_div > 0
+            else CODES_PER_DIV
+        )
+        gain_v_per_code = vdiv / codes_per_div  # 面板 VDIV（已含探头衰减）
+        offset_v = offset  # 面板 OFST（已含探头衰减）
+        voltages = [
+            _siglent_byte_to_voltage(byte, gain_v_per_code, offset_v)
+            for byte in raw
+        ]
+        decode_source = (
+            "wavedesc_cpd__panel_vdiv_ofst"
+            if wavedesc is not None
+            else "fallback_codes_per_div"
+        )
+        gain_used = gain_v_per_code
+        offset_used = offset_v
 
         # --- 6. 时间轴定标：优先 WAVEDESC，fallback 到 SARA/触发居中 ---
         # WAVEDESC 提供精确的 HORIZ_INTERVAL 和 HORIZ_OFFSET。
@@ -630,6 +629,7 @@ class SDS800XHDTcpAdapter:
             "raw_responses": {
                 "vdiv": vdiv_raw,
                 "offset": ofst_raw,
+                "probe_attenuation": attn_raw,
                 "timebase": tdiv_raw,
                 "sample_rate": sara_raw,
             },
@@ -648,7 +648,6 @@ class SDS800XHDTcpAdapter:
                 "vertical_offset_v": offset_used,
                 "time_source": time_source,
                 "codes_per_div_fallback": CODES_PER_DIV,
-                "wavedesc_vdiv_mismatch": wavedesc_vdiv_mismatch,
             },
             "binary": {"bytes": len(raw), "framing": block.framing},
             "points": {
@@ -886,29 +885,38 @@ def _parse_number_with_units(value: str) -> float:
     raise ValueError(f"cannot parse numeric value: {value!r}")
 
 
-def _siglent_byte_to_voltage(byte: int, vdiv: float, offset: float) -> float:
-    # SIGLENT WF? DAT2 返回 8bit 有符号编码。
-    # SDS824X HD 实测：编码模式随 OFST 变化——
-    #   OFST=0V: 原始 ADC 数据，code_signed × gain 即得电压
-    #   OFST≠0V: 数据中心化，byte 128 对应 OFST 电压，
-    #             公式为 (byte-128) × gain + OFST
-    code = byte if byte <= 127 else byte - 256
-    gain = vdiv / CODES_PER_DIV
-    if offset == 0.0:
-        return code * gain
+def _siglent_byte_to_voltage(byte: int, gain_v_per_code: float, offset_v: float) -> float:
+    """将原始 byte 解码为电压。
+
+    参数:
+        byte: 原始采样值 (0~255)
+        gain_v_per_code: 每码电压 (V/code)，= VDIV / codes_per_div
+        offset_v: 垂直偏移 (V)，= 面板 OFST
+
+    编码模式:
+        OFST=0V: 原始 ADC 有符号编码，code_signed × gain 即得电压
+        OFST≠0V: 数据中心化，byte 128 对应 OFST 电压
+    """
+    if offset_v == 0.0:
+        code = byte if byte <= 127 else byte - 256
+        return code * gain_v_per_code
     else:
-        return (byte - 128) * gain + offset
+        return (byte - 128) * gain_v_per_code + offset_v
 
 
-def _siglent_byte_to_voltage_gain(byte: int, vertical_gain: float, vertical_offset: float) -> float:
-    # WAVEDESC 解码：与 fallback 同理，编码模式取决于 OFST 是否为零。
-    # WAVEDESC 内 VERTICAL_GAIN/VERTICAL_OFFSET 为 scope 输入端电平，
-    # 需 × ATTN 转换为探头端电平（由调用方在 gain 和 offset 中已处理）。
-    code = byte if byte <= 127 else byte - 256
+def _siglent_byte_to_voltage_gain(
+    byte: int, vertical_gain: float, vertical_offset: float, probe_attn: float = 1.0
+) -> float:
+    """WAVEDESC 解码。
+
+    WAVEDESC 内 VERTICAL_GAIN/VERTICAL_OFFSET 为 scope 输入端电平（已含探头衰减
+    补偿前的原始值）。为与面板读数（探头端）一致，结果整体 × probe_attn。
+    """
     if vertical_offset == 0.0:
-        return code * vertical_gain
+        code = byte if byte <= 127 else byte - 256
+        return code * vertical_gain * probe_attn
     else:
-        return (byte - 128) * vertical_gain + vertical_offset
+        return ((byte - 128) * vertical_gain + vertical_offset) * probe_attn
 
 
 def _inspect_bmp(data: bytes) -> dict[str, Any]:
