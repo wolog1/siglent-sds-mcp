@@ -309,9 +309,26 @@ def project_status() -> dict[str, Any]:
     """Return implementation status and verification boundary."""
 
     return {
-        "status": "verified-on-hardware",
+        "status": "hardware-tested-alpha",
         "target": "SIGLENT SDS824X HD / SDS800X HD",
+        "firmware_verified": "4.8.12.1.1.6.5",
         "transport": "raw TCP SCPI socket, port 5025",
+        "verified_on_hardware": [
+            "TCP 5025 connection",
+            "*IDN? identity query",
+            "CHDR OFF header suppression",
+            "SCDP screen capture returning BMP/raw image bytes",
+            "WF? DAT2 waveform data read with WFSU SP,1,NP,0,FP,0",
+            "WF? DESC WAVEDESC descriptor read and adaptive decode",
+            "TRMD AUTO + wait + STOP acquisition sequence for readable waveform memory",
+            "min/max envelope waveform CSV export",
+            "auto_find_waveform_tcp found active signal and returned final_stats",
+        ],
+        "known_issues": [
+            "C?:TRLV trigger-level command may not take effect on firmware 4.8.12.1.1.6.5; AUTO-mode display still works, but stable trigger-level control needs follow-up.",
+            "OFST=vmean display-centering direction remains marked needs_hardware_validation until checked with a known 3.3V square wave.",
+            "Long timebase waveform capture currently waits max(tdiv*20, 0.2s); add a capped wait once slow-timebase field behavior is verified.",
+        ],
         "tcp_tools": [
             "connect_tcp",
             "disconnect_tcp",
@@ -331,7 +348,7 @@ def project_status() -> dict[str, Any]:
             "modbus_rtu_timing",
             "generate_report",
         ],
-        "status_note": "经 SDS824X HD 真机验证。WAVEDESC 自适应解码，自动重连，min/max 包络抽样，已加入自动找波形工具。",
+        "status_note": "Hardware-tested alpha: core SDS824X HD capture path works, with known follow-up items around trigger-level SCPI and offset-direction validation.",
     }
 
 
