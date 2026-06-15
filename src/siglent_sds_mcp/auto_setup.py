@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from .artifacts import default_artifact_paths, ensure_parent, write_json
@@ -96,7 +95,7 @@ class AutoSetupResult:
             "recommended_offset": self.recommended_offset,
             "recommended_timebase": self.recommended_timebase,
             "trigger_level": self.trigger_level,
-            "probes": [probe.__dict__ for probe in self.probes],
+            "probes": [asdict(probe) for probe in self.probes],
             "final_waveform_csv": self.final_waveform_csv,
             "final_metadata_path": self.final_metadata_path,
             "screenshot_path": self.screenshot_path,
