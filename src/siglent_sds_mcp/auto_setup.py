@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Literal
@@ -15,6 +16,7 @@ from .sds_tcp_adapter import (
 )
 
 SignalHint = Literal["unknown", "uart", "rs485", "modbus", "pwm", "clock"]
+MIN_PERIODIC_SIGNAL_VPP = 0.005
 
 
 @dataclass(slots=True)
@@ -60,12 +62,13 @@ def auto_find_waveform(
     refine_attempts: int = 3,  # accepted for API compatibility
     leave_stopped: bool = True,
     set_trigger_level: bool = False,
+    min_signal_vpp: float = MIN_PERIODIC_SIGNAL_VPP,
 ) -> AutoSetupResult:
     """Find, range, and optionally hold an active waveform on screen.
 
-    This compatibility implementation no longer depends on the removed
-    `waveform_stats.py`. It uses the SDS measurement engine first, which is the
-    current hardware-tested direction for SDS824X HD auto setup.
+    `noise_floor_v` is treated as the default strong-signal threshold. A smaller
+    periodic waveform can still be accepted when the scope measurement engine
+    reports a valid frequency or period and Vpp is above `min_signal_vpp`.
     """
 
     candidate_channels: list[Channel] = channels or ["C1", "C2", "C3", "C4"]
@@ -79,6 +82,7 @@ def auto_find_waveform(
             coarse_timebase=coarse_timebase,
             initial_vdiv=initial_vdiv,
             noise_floor_v=noise_floor_v,
+            min_signal_vpp=min_signal_vpp,
             settle_s=settle_s,
             probe=probe,
             leave_stopped=leave_stopped,
@@ -126,6 +130,7 @@ def _auto_setup_one_channel(
     coarse_timebase: str,
     initial_vdiv: str,
     noise_floor_v: float,
+    min_signal_vpp: float,
     settle_s: float,
     probe: float,
     leave_stopped: bool,
@@ -153,25 +158,45 @@ def _auto_setup_one_channel(
     coarse = _measure_summary(scope, channel)
     coarse_pkpk = float(coarse.get("pkpk_v") or 0.0)
     dc_v = float(coarse.get("mean_v") or 0.0)
-    steps.append({"stage": "coarse", **coarse})
+    frequency_hz = _as_float(coarse.get("frequency_hz"))
+    period_s = _as_float(coarse.get("period_s"))
+    if period_s is None and frequency_hz and frequency_hz > 0:
+        period_s = 1.0 / frequency_hz
 
-    if coarse_pkpk < noise_floor_v:
+    periodic_evidence = _has_periodic_evidence(frequency_hz=frequency_hz, period_s=period_s)
+    detection = _classify_signal(
+        pkpk_v=coarse_pkpk,
+        noise_floor_v=noise_floor_v,
+        min_signal_vpp=min_signal_vpp,
+        periodic_evidence=periodic_evidence,
+    )
+    steps.append(
+        {
+            "stage": "coarse",
+            **coarse,
+            "periodic_evidence": periodic_evidence,
+            "detection": detection,
+        }
+    )
+
+    if not bool(detection["signal_detected"]):
         return {
             "channel": channel,
             "signal_detected": False,
             "confidence": "low",
             "measurements": coarse,
+            "periodic_evidence": periodic_evidence,
+            "noise_floor_v": noise_floor_v,
+            "min_signal_vpp": min_signal_vpp,
             "probe_steps": steps,
-            "reason": "pkpk below noise_floor_v during coarse measurement",
+            "reason": detection["reason"],
         }
 
-    final_vdiv = _pick_vdiv(max(coarse_pkpk, noise_floor_v))
+    # For low-amplitude periodic signals, use the measured Vpp instead of inflating
+    # display range to noise_floor_v. Example: 22.5mV should choose 5mV/div, not
+    # 10mV/div or larger, so the waveform becomes visible on the screen.
+    final_vdiv = _pick_vdiv(max(coarse_pkpk, min_signal_vpp))
     final_ofst = _clamp(dc_v, -final_vdiv * 6.0, final_vdiv * 6.0)
-
-    frequency_hz = _as_float(coarse.get("frequency_hz"))
-    period_s = _as_float(coarse.get("period_s"))
-    if period_s is None and frequency_hz and frequency_hz > 0:
-        period_s = 1.0 / frequency_hz
     final_tdiv = _pick_tdiv(period_s or 0.0)
 
     vmax = _as_float(coarse.get("max_v"))
@@ -209,11 +234,15 @@ def _auto_setup_one_channel(
     return {
         "channel": channel,
         "signal_detected": True,
-        "confidence": "medium" if coarse_pkpk < noise_floor_v * 10 else "high",
+        "confidence": detection["confidence"],
+        "reason": detection["reason"],
         "screen_hold": leave_stopped,
         "leave_stopped": leave_stopped,
         "trigger_level_command_sent": set_trigger_level,
         "probe": probe,
+        "noise_floor_v": noise_floor_v,
+        "min_signal_vpp": min_signal_vpp,
+        "periodic_evidence": periodic_evidence,
         "final_settings": {
             "vdiv_v": final_vdiv,
             "offset_v": final_ofst,
@@ -254,6 +283,38 @@ def _measure(
         return _parse_meas_value(scope.measure(channel, parameter)["value"])
     except Exception:  # noqa: BLE001 - measurement probing should degrade gracefully
         return None
+
+
+def _classify_signal(
+    *,
+    pkpk_v: float,
+    noise_floor_v: float,
+    min_signal_vpp: float,
+    periodic_evidence: bool,
+) -> dict[str, object]:
+    if pkpk_v >= noise_floor_v:
+        return {
+            "signal_detected": True,
+            "confidence": "high" if pkpk_v >= noise_floor_v * 10 else "medium",
+            "reason": "pkpk above noise_floor_v",
+        }
+    if periodic_evidence and pkpk_v >= min_signal_vpp:
+        return {
+            "signal_detected": True,
+            "confidence": "low",
+            "reason": "periodic signal accepted below noise_floor_v because frequency/period is valid",
+        }
+    return {
+        "signal_detected": False,
+        "confidence": "low",
+        "reason": "pkpk below thresholds and no valid periodic evidence",
+    }
+
+
+def _has_periodic_evidence(frequency_hz: float | None, period_s: float | None) -> bool:
+    if frequency_hz is not None and math.isfinite(frequency_hz) and frequency_hz > 0:
+        return True
+    return bool(period_s is not None and math.isfinite(period_s) and period_s > 0)
 
 
 def _trigger_slope(signal_hint: SignalHint) -> Literal["POS", "NEG"]:
