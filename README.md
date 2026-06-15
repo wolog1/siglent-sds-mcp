@@ -94,7 +94,7 @@ When `max_points` < raw sample count, each bucket outputs min + max voltages (wi
 
 ### Screenshot/CSV same-frame guarantee
 
-`auto_find_waveform` final capture: `STOP → screenshot → get_waveform(restore_trmd=False) → analyze final stats → ARM`. Screenshot and CSV are always from the same acquisition frame.
+`auto_find_waveform` final capture uses `get_waveform(restore_trmd=False)` first. That function switches to `TRMD AUTO`, waits for a fresh acquisition, sends `STOP`, exports the CSV, and intentionally leaves the scope stopped. `auto_find_waveform` then calls `screenshot()` before restarting acquisition with `ARM`, so the screenshot and CSV are taken from the same stopped acquisition frame.
 
 ## Project structure
 
