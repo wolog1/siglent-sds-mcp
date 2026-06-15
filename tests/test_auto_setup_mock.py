@@ -199,7 +199,6 @@ class TestAutoSetupMock:
 
         # Verify call order: get_waveform (STOPs internally, stays stopped) →
         # screenshot (same frame) → ARM (restart)
-        from unittest.mock import call as mc
 
         # get_waveform called twice: coarse scan + final (with restore_trmd=False)
         wf_calls = mock_scope.get_waveform.call_args_list

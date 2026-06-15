@@ -86,7 +86,7 @@ class AutoSetupResult:
     screenshot_path: str | None = None
     report_json_path: str | None = None
     notes: list[str] = field(default_factory=list)
-    offset_direction_status: str = "needs_hardware_validation"
+    offset_direction_status: str = "verified_on_sds824xhd: voltage=code*gain+offset"
 
     def to_dict(self) -> dict[str, object]:
         return {

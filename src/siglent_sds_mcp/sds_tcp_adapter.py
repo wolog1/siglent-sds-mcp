@@ -677,15 +677,19 @@ def _siglent_byte_to_voltage(byte: int, vdiv: float, offset: float) -> float:
     # SIGLENT WF? DAT2 返回 8bit 有符号编码。无符号字节转有符号：>127 时减 256。
     # 每格码值由 CODES_PER_DIV 给出（SDS824X HD 实测为 30）。
     # 仅在无 WAVEDESC 可用时作为 fallback 使用。
+    #
+    # OFST 方向（SDS824X HD 实测）: voltage = code * gain + OFST
+    # 使用 "+ offset" 而非 "- offset"——当 OFST=3.28V 时，屏幕中心(code≈0)
+    # 应对应 3.28V，用减法会得到 -3.28V（明显错误）。
     code = byte if byte <= 127 else byte - 256
-    return code * (vdiv / CODES_PER_DIV) - offset
+    return code * (vdiv / CODES_PER_DIV) + offset
 
 
 def _siglent_byte_to_voltage_gain(byte: int, vertical_gain: float, vertical_offset: float) -> float:
-    # WAVEDESC 自适应解码：voltage = code * VERTICAL_GAIN - VERTICAL_OFFSET
-    # VERTICAL_GAIN 和 VERTICAL_OFFSET 直接来自描述符，无需知道 CODES_PER_DIV。
+    # WAVEDESC 自适应解码：voltage = code * VERTICAL_GAIN + VERTICAL_OFFSET
+    # SDS824X HD 实测确认 OFST 方向为 + 而非 -。
     code = byte if byte <= 127 else byte - 256
-    return code * vertical_gain - vertical_offset
+    return code * vertical_gain + vertical_offset
 
 
 def _inspect_bmp(data: bytes) -> dict[str, Any]:
