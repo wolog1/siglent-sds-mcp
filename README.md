@@ -21,9 +21,9 @@ python -m siglent_sds_mcp.server
 python examples/tcp_idn_test.py <scope-ip>
 ```
 
-## Auto-find waveform — one-command capture
+## Auto-find waveform — one-command screen setup
 
-The headline feature: point at an unknown signal and get a screenshot + waveform CSV with automatic vertical/horizontal/trigger setup.
+The headline feature: point at an unknown signal and leave the detected waveform visible on the scope screen, with screenshot + waveform CSV artifacts.
 
 ```bash
 python examples/auto_find_waveform_tcp.py <scope-ip> --channels C1 C2 C3 C4
@@ -31,16 +31,18 @@ python examples/auto_find_waveform_tcp.py <scope-ip> --channels C1 C2 C3 C4
 # With signal-type hint for better timebase selection
 python examples/auto_find_waveform_tcp.py <scope-ip> --signal-hint uart
 
-# Tune capture parameters
+# Direct TTL wiring / 1X probe
 python examples/auto_find_waveform_tcp.py <scope-ip> \
-    --channels C1 C2 \
-    --coarse-timebase 1MS \
-    --initial-vdiv 1V \
-    --max-points 5000 \
-    --noise-floor 0.05
+    --channels C1 \
+    --signal-hint clock \
+    --probe 1 \
+    --refine-attempts 3
+
+# Restart acquisition after capture only when explicitly requested
+python examples/auto_find_waveform_tcp.py <scope-ip> --restart-after-capture
 ```
 
-Output: `found`, `selected_channel`, `recommended_vdiv/offset/timebase`, `screenshot_path`, `final_waveform_csv`, `coarse_stats` vs `final_stats`, JSON report.
+Default behavior: `leave_stopped=true`. The tool intentionally leaves the scope stopped on the final visible frame. Output includes `screen_hold`, `refine_history`, `final_panel_state`, `screenshot_path`, `final_waveform_csv`, `coarse_stats`, and `final_stats`.
 
 ## Architecture
 
@@ -60,8 +62,8 @@ tcp_transport.py — RawTcpTransport
   │  thread-safe (RLock), pre-query socket flush
   ▼
 auto_setup.py — auto_find_waveform
-  │  channel scan → Vpp/edge scoring → VDIV/OFST/TDIV selection →
-  │  screenshot + CSV from same STOP frame → final stats validation
+  │  channel scan → Vpp/edge scoring → VDIV/OFST/TDIV refinement →
+  │  final stopped-frame screenshot + CSV → panel-state validation
   ▼
 waveform_stats.py — edge detection, Vpp, threshold, clipping hint
 
@@ -92,18 +94,22 @@ When `max_points` < raw sample count, each bucket outputs min + max voltages (wi
 - `ARM` then `STOP`: ARM resets acquisition to "armed, waiting" state — may not trigger in AUTO mode
 - **Correct**: `TRMD AUTO` + wait ≥200ms + `STOP` — ensures waveform reflects current panel settings
 
-### Screenshot/CSV same-frame guarantee
+### Screenshot/CSV same-frame and screen-hold guarantee
 
-`auto_find_waveform` final capture uses `get_waveform(restore_trmd=False)` first. That function switches to `TRMD AUTO`, waits for a fresh acquisition, sends `STOP`, exports the CSV, and intentionally leaves the scope stopped. `auto_find_waveform` then calls `screenshot()` before restarting acquisition with `ARM`, so the screenshot and CSV are taken from the same stopped acquisition frame.
+`auto_find_waveform` final capture uses `get_waveform(restore_trmd=False)`. That function switches to `TRMD AUTO`, waits for a fresh acquisition, sends `STOP`, exports the CSV, and intentionally leaves the scope stopped. `auto_find_waveform` then calls `screenshot()` and collects final panel state. It does **not** restart acquisition unless `leave_stopped=false` / `--restart-after-capture` is explicitly requested.
+
+### Trigger level policy
+
+`C?:TRLV <level>` is not sent by default because it is a known issue on SDS824X HD firmware `4.8.12.1.1.6.5`. AUTO-mode capture is the default display-oriented path. Use `set_trigger_level=true` only for trigger-command investigation.
 
 ## Project structure
 
 ```
 src/siglent_sds_mcp/
-  server.py              — 16+ MCP tools, auto-reconnect, FastMCP
+  server.py              — MCP tools, auto-reconnect, FastMCP
   sds_tcp_adapter.py     — Command adapter, WAVEDESC decode, envelope, capture
   tcp_transport.py       — Raw TCP socket, lock, binary block parser
-  auto_setup.py          — auto_find_waveform: scan → score → configure → capture
+  auto_setup.py          — auto_find_waveform: scan → score → refine → hold screen
   waveform_stats.py      — Edge detection, Vpp, threshold, clipping hint
   uart_analyzer.py       — Offline UART CSV analyzer
   rs485_analyzer.py      — RS485 differential pair analyzer
@@ -138,14 +144,14 @@ Raw SCPI writes are NOT exposed as MCP tools. `safe_scpi_query_tcp` only accepts
 ## Test coverage
 
 ```bash
-pytest -q          # 61 tests
+pytest -q
 ```
 
 Key test areas:
-- `test_unit_parsing.py` — 24 tests: `_parse_voltage`, `_parse_time`, `_parse_sample_rate` (mV≠MV, MS=milliseconds)
+- `test_unit_parsing.py` — `_parse_voltage`, `_parse_time`, `_parse_sample_rate`
 - `test_wavedesc.py` / `test_wavedesc_parser.py` — synthetic WAVEDESC decode, ASCII prefix handling
 - `test_tcp_binary_prefix.py` — `query_binary` IEEE 488.2 / BMP prefix skipping
-- `test_auto_setup_mock.py` — mock scope channel selection, NEG slope, coarse/final stats
+- `test_auto_setup_mock.py` — channel selection, no default ARM, trigger policy, probe, stats
 - `test_waveform_stats.py` — edge detection, active/inactive classification
 - `test_tcp_transport_parser.py` — socketpair binary block parsing
 
