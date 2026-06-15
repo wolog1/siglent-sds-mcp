@@ -674,22 +674,28 @@ def _parse_number_with_units(value: str) -> float:
 
 
 def _siglent_byte_to_voltage(byte: int, vdiv: float, offset: float) -> float:
-    # SIGLENT WF? DAT2 返回 8bit 有符号编码。无符号字节转有符号：>127 时减 256。
-    # 每格码值由 CODES_PER_DIV 给出（SDS824X HD 实测为 30）。
-    # 仅在无 WAVEDESC 可用时作为 fallback 使用。
-    #
-    # OFST 方向（SDS824X HD 实测）: voltage = code * gain + OFST
-    # 使用 "+ offset" 而非 "- offset"——当 OFST=3.28V 时，屏幕中心(code≈0)
-    # 应对应 3.28V，用减法会得到 -3.28V（明显错误）。
+    # SIGLENT WF? DAT2 返回 8bit 有符号编码。
+    # SDS824X HD 实测：编码模式随 OFST 变化——
+    #   OFST=0V: 原始 ADC 数据，code_signed × gain 即得电压
+    #   OFST≠0V: 数据中心化，byte 128 对应 OFST 电压，
+    #             公式为 (byte-128) × gain + OFST
     code = byte if byte <= 127 else byte - 256
-    return code * (vdiv / CODES_PER_DIV) + offset
+    gain = vdiv / CODES_PER_DIV
+    if offset == 0.0:
+        return code * gain
+    else:
+        return (byte - 128) * gain + offset
 
 
 def _siglent_byte_to_voltage_gain(byte: int, vertical_gain: float, vertical_offset: float) -> float:
-    # WAVEDESC 自适应解码：voltage = code * VERTICAL_GAIN + VERTICAL_OFFSET
-    # SDS824X HD 实测确认 OFST 方向为 + 而非 -。
+    # WAVEDESC 解码：与 fallback 同理，编码模式取决于 OFST 是否为零。
+    # WAVEDESC 内 VERTICAL_GAIN/VERTICAL_OFFSET 为 scope 输入端电平，
+    # 需 × ATTN 转换为探头端电平（由调用方在 gain 和 offset 中已处理）。
     code = byte if byte <= 127 else byte - 256
-    return code * vertical_gain + vertical_offset
+    if vertical_offset == 0.0:
+        return code * vertical_gain
+    else:
+        return (byte - 128) * vertical_gain + vertical_offset
 
 
 def _inspect_bmp(data: bytes) -> dict[str, Any]:
