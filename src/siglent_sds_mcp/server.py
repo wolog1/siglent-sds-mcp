@@ -169,25 +169,59 @@ def measure_tcp(
     return _tcp_adapter().measure(channel=channel, parameter=parameter)
 
 
+def _run_auto_setup(
+    channel_list: list[Literal["C1", "C2", "C3", "C4"]],
+    signal_hint: Literal["unknown", "uart", "rs485", "modbus", "pwm", "clock"],
+    coarse_timebase: str,
+    initial_vdiv: str,
+    max_points: int,
+    noise_floor_v: float,
+    settle_s: float,
+    probe: float,
+    refine_attempts: int,
+    leave_stopped: bool,
+    set_trigger_level: bool,
+) -> dict[str, object]:
+    result = auto_find_waveform(
+        _tcp_adapter(),
+        channels=list(channel_list),
+        signal_hint=signal_hint,
+        coarse_timebase=coarse_timebase,
+        initial_vdiv=initial_vdiv,
+        max_points=max_points,
+        noise_floor_v=noise_floor_v,
+        settle_s=settle_s,
+        probe=probe,
+        refine_attempts=refine_attempts,
+        leave_stopped=leave_stopped,
+        set_trigger_level=set_trigger_level,
+    )
+    return result.to_dict()
+
+
 @mcp.tool()
 def auto_setup_tcp(
     channel: Literal["C1", "C2", "C3", "C4"] = "C1",
-    target_cycles: float = 4.0,
+    signal_hint: Literal["unknown", "uart", "rs485", "modbus", "pwm", "clock"] = "unknown",
     settle_s: float = 0.6,
-    screenshot_path: str | None = None,
-) -> dict[str, Any]:
-    """自动探测信号并把波形调整到屏幕最佳显示（类似面板 Auto Setup）。
+    probe: float = 10.0,
+    leave_stopped: bool = True,
+    set_trigger_level: bool = False,
+) -> dict[str, object]:
+    """Auto setup one channel and leave the waveform visible by default."""
 
-    流程：宽量程粗测 → 时基扫描定位 AC → 精测频率/幅度 →
-    设置最佳 VDIV/OFST/TDIV/触发电平 → 可选截图。
-    适用于信号被当前量程/时基/触发设置"盖住"看不到的场景。
-    """
-
-    return _tcp_adapter().auto_setup(
-        channel=channel,
-        target_cycles=target_cycles,
+    return _run_auto_setup(
+        channel_list=[channel],
+        signal_hint=signal_hint,
+        coarse_timebase="1MS",
+        initial_vdiv="1V",
+        max_points=2000,
+        noise_floor_v=0.05,
         settle_s=settle_s,
-        screenshot_path=screenshot_path,
+        probe=probe,
+        refine_attempts=1,
+        leave_stopped=leave_stopped,
+        set_trigger_level=set_trigger_level,
     )
 
 
@@ -241,14 +275,7 @@ def capture_uart_2mbps_tcp(
 @mcp.tool()
 def auto_find_waveform_tcp(
     channels: list[Literal["C1", "C2", "C3", "C4"]] | None = None,
-    signal_hint: Literal[
-        "unknown",
-        "uart",
-        "rs485",
-        "modbus",
-        "pwm",
-        "clock",
-    ] = "unknown",
+    signal_hint: Literal["unknown", "uart", "rs485", "modbus", "pwm", "clock"] = "unknown",
     coarse_timebase: str = "1MS",
     initial_vdiv: str = "1V",
     max_points: int = 2000,
@@ -258,22 +285,21 @@ def auto_find_waveform_tcp(
     leave_stopped: bool = True,
     set_trigger_level: bool = False,
 ) -> dict[str, object]:
-    """Automatically find, auto-range and leave an active waveform visible."""
+    """Backwards-compatible multi-channel auto setup entry point."""
 
-    result = auto_find_waveform(
-        _tcp_adapter(),
-        channels=list(channels) if channels else None,
+    return _run_auto_setup(
+        channel_list=list(channels) if channels else ["C1", "C2", "C3", "C4"],
         signal_hint=signal_hint,
         coarse_timebase=coarse_timebase,
         initial_vdiv=initial_vdiv,
         max_points=max_points,
         noise_floor_v=noise_floor_v,
+        settle_s=0.6,
         probe=probe,
         refine_attempts=refine_attempts,
         leave_stopped=leave_stopped,
         set_trigger_level=set_trigger_level,
     )
-    return result.to_dict()
 
 
 @mcp.tool()
@@ -366,21 +392,18 @@ def project_status() -> dict[str, Any]:
             "SCDP screen capture returning BMP/raw image bytes",
             "WF? DAT2 waveform data read with WFSU SP,1,NP,0,FP,0",
             "WF? DESC WAVEDESC descriptor read and adaptive decode",
-            "TRMD AUTO + wait + STOP acquisition sequence",
-            "min/max envelope waveform CSV export",
-            "auto_find_waveform_tcp can capture an active signal and return final_stats",
+            "measurement-driven auto_setup can find and range active signals",
         ],
         "known_issues": [
             "C?:TRLV may not take effect on firmware 4.8.12.1.1.6.5; "
-            "auto-find does not send trigger level by default.",
-            "Slow timebase waveform capture currently waits max(tdiv*20, 0.2s).",
+            "auto setup does not depend on trigger level by default.",
+            "get_waveform acquisition sequencing is hardware-sensitive; verify after changes.",
         ],
-        "default_auto_find_behavior": {
+        "default_auto_setup_behavior": {
             "leave_stopped": True,
             "screen_hold": "scope remains stopped on final visible frame",
             "set_trigger_level": False,
             "probe": 10.0,
-            "refine_attempts": 3,
         },
         "tcp_tools": [
             "connect_tcp",
@@ -402,7 +425,7 @@ def project_status() -> dict[str, Any]:
             "modbus_rtu_timing",
             "generate_report",
         ],
-        "status_note": "Hardware-tested alpha; auto-find defaults to holding final frame.",
+        "status_note": "Hardware-tested alpha; auto setup now has unified MCP entry points.",
     }
 
 
