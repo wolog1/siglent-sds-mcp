@@ -13,40 +13,50 @@ from .tcp_transport import RawTcpTransport
 from .uart_analyzer import analyze_uart_csv
 
 # SDS800X HD 系列 WF? DAT2 返回 8bit 字节编码，垂直满屏 8 格。
-# 每格对应的码值（code-per-div）经真机 SDS824X HD 实测确认为 30，而非
-# 旧 SDS1000X-E 的 25：
-#   - 原始码值范围 [-68, +41]，VDIV=0.2V，OFST=-0.24V；
-#   - 取 30 码/格解码得 [-0.213V, +0.513V]，与面板实测 [-0.204V, +0.515V] 吻合；
-#   - 取 25 码/格解码得 [-0.304V, +0.568V]，系统性偏大约 20%（错误）；
-#   - WAVEDESC.MAX_VALUE = 7680 = 30 × 256，再次佐证 30 码/格。
-# 优先从 WAVEDESC 读取 VERTICAL_GAIN 进行自适应解码（见 _parse_wavedesc）；
-# 仅当描述符不可用或解析失败时，回退到本硬编码常量。
+# 优先从 WAVEDESC 二进制描述符自适应推导每码电压，无需硬编码型号特定常量。
+# 仅当描述符不可用时，回退到 SDS824X HD 实测值 CODES_PER_DIV=30。
 CODES_PER_DIV = 30
 
 # ---------------------------------------------------------------------------
-# WAVEDESC 二进制描述符字段偏移（Siglent SDS 系列，little-endian）
-# 参考：Siglent SDS Programming Guide EN11D / LeCroy WAVEDESC 规范。
-# 解码公式：voltage(code) = code * VERTICAL_GAIN - VERTICAL_OFFSET
+# WAVEDESC 二进制描述符字段偏移（Siglent SDS824X HD 实测，little-endian）
+#
+# 关键字段布局（相对 b"WAVEDESC" 签名起点）：
+#   [116] WAVE_ARRAY_COUNT  int32   — 采样点数
+#   [156] VERTICAL_GAIN     float32 — V/div（即 VDIV，注意：不是 V/code）
+#   [160] VERTICAL_OFFSET   float32 — 垂直偏移 (V)，等于面板 OFST
+#   [164] MAX_VALUE         float32 — ADC 满幅码值 = codes_per_div × 256
+#                                     SDS824X HD 实测 7680 = 30 × 256
+#   [176] HORIZ_INTERVAL    float32 — 水平采样间隔 (s/sample)
+#   [180] HORIZ_OFFSET      float64 — 触发时刻相对首采样点偏移 (s)，= 面板 TRDL
+#
+# 电压解码公式（WAVEDESC 自适应推导）：
+#   codes_per_div  = MAX_VALUE / 256
+#   gain_v_per_code = VERTICAL_GAIN / codes_per_div      (= VDIV / CPD)
+#   voltage         = code × gain_v_per_code - VERTICAL_OFFSET
 # ---------------------------------------------------------------------------
 _WAVEDESC_SIGNATURE = b"WAVEDESC"   # 描述符起始标记，位于 offset 0
-_OFF_WAVE_ARRAY_COUNT: int = 116    # int32  — 采样点数
-_OFF_VERTICAL_GAIN: int    = 156    # float32 — 码值→伏特缩放系数 (V/code)
+_OFF_WAVE_ARRAY_COUNT: int = 116    # int32   — 采样点数
+_OFF_VERTICAL_GAIN: int    = 156    # float32 — V/div（非 V/code）
 _OFF_VERTICAL_OFFSET: int  = 160    # float32 — 垂直偏移 (V)
+_OFF_MAX_VALUE: int        = 164    # float32 — ADC 满幅码值
 _OFF_HORIZ_INTERVAL: int   = 176    # float32 — 水平采样间隔 (s/sample)
-_OFF_HORIZ_OFFSET: int     = 180    # float64 — 触发偏移 (s)，首点 = -HORIZ_OFFSET
+_OFF_HORIZ_OFFSET: int     = 180    # float64 — 触发偏移 (s)，= TRDL
 
 
 @dataclass(slots=True)
 class WaveDescriptor:
     """从 WAVEDESC 二进制块解析出的关键定标参数。"""
 
-    vertical_gain: float    # V/code
-    vertical_offset: float  # V（解码公式：v = code * gain - offset）
-    horiz_interval: float   # s/sample（0 → 不可用）
-    horiz_offset: float     # s，触发点相对首采样点的偏移（0 → 不可用）
-    wave_array_count: int   # 描述符中记录的点数（0 → 不可用）
-    raw_bytes: int          # 描述符总字节数（用于诊断）
-    source: str             # "wavedesc" | "fallback"
+    vertical_gain_vdiv: float   # V/div（WAVEDESC VERTICAL_GAIN 字段原始值）
+    max_value: float            # ADC 满幅码值（= codes_per_div × 256）
+    codes_per_div: float        # = max_value / 256，如 SDS824X HD 为 30.0
+    gain_v_per_code: float      # 每码电压 = VDIV / codes_per_div (V/code)
+    vertical_offset: float      # V（解码：v = code × gain_v_per_code - offset）
+    horiz_interval: float       # s/sample
+    horiz_offset: float         # s，= TRDL
+    wave_array_count: int       # 描述符中记录的点数
+    raw_bytes: int              # 描述符总字节数（诊断用）
+    source: str                 # "wavedesc" | "fallback"
 
 
 def _parse_wavedesc(data: bytes) -> WaveDescriptor | None:
@@ -55,7 +65,8 @@ def _parse_wavedesc(data: bytes) -> WaveDescriptor | None:
     SIGLENT SDS 返回的描述符数据开头可能附带 ASCII 前缀（如 "C1:WF DESC,"），
     本函数自动搜索 b"WAVEDESC" 标记并从其偏移处解析字段。
     """
-    # 定位描述符起始签名
+    import math
+
     idx = data.find(_WAVEDESC_SIGNATURE)
     if idx < 0:
         return None
@@ -67,16 +78,26 @@ def _parse_wavedesc(data: bytes) -> WaveDescriptor | None:
         (wave_array_count,) = struct.unpack_from("<i", desc, _OFF_WAVE_ARRAY_COUNT)
         (vertical_gain,)    = struct.unpack_from("<f", desc, _OFF_VERTICAL_GAIN)
         (vertical_offset,)  = struct.unpack_from("<f", desc, _OFF_VERTICAL_OFFSET)
+        (max_value,)        = struct.unpack_from("<f", desc, _OFF_MAX_VALUE)
         (horiz_interval,)   = struct.unpack_from("<f", desc, _OFF_HORIZ_INTERVAL)
         (horiz_offset,)     = struct.unpack_from("<d", desc, _OFF_HORIZ_OFFSET)
     except struct.error:
         return None
-    # 基本合理性检验：gain 为 0 或 NaN 时认为不可用
-    import math
-    if vertical_gain == 0.0 or not math.isfinite(vertical_gain):
+
+    # 合理性检验
+    if not math.isfinite(vertical_gain) or vertical_gain == 0.0:
         return None
+    if not math.isfinite(max_value) or max_value <= 0.0:
+        return None
+
+    codes_per_div = max_value / 256.0
+    gain_v_per_code = float(vertical_gain) / codes_per_div
+
     return WaveDescriptor(
-        vertical_gain=float(vertical_gain),
+        vertical_gain_vdiv=float(vertical_gain),
+        max_value=float(max_value),
+        codes_per_div=codes_per_div,
+        gain_v_per_code=gain_v_per_code,
         vertical_offset=float(vertical_offset),
         horiz_interval=float(horiz_interval),
         horiz_offset=float(horiz_offset),
@@ -307,15 +328,16 @@ class SDS800XHDTcpAdapter:
         total_points = len(raw)
 
         # --- 4. 电压解码：优先 WAVEDESC，fallback 到 CODES_PER_DIV 常量 ---
-        # WAVEDESC 公式：voltage = code * VERTICAL_GAIN - VERTICAL_OFFSET
-        # Fallback 公式：voltage = code * (vdiv / CODES_PER_DIV) - offset
-        if wavedesc is not None and wavedesc.vertical_gain != 0.0:
+        # WAVEDESC 解码：voltage = code × gain_v_per_code - VERTICAL_OFFSET
+        #   gain_v_per_code = VDIV / (MAX_VALUE / 256) = VDIV / codes_per_div
+        # Fallback 公式：voltage = code × (vdiv / CODES_PER_DIV) - offset
+        if wavedesc is not None and wavedesc.gain_v_per_code != 0.0:
             voltages = [
-                _siglent_byte_to_voltage_gain(byte, wavedesc.vertical_gain, wavedesc.vertical_offset)
+                _siglent_byte_to_voltage_gain(byte, wavedesc.gain_v_per_code, wavedesc.vertical_offset)
                 for byte in raw
             ]
             decode_source = "wavedesc"
-            gain_used = wavedesc.vertical_gain
+            gain_used = wavedesc.gain_v_per_code
             offset_used = wavedesc.vertical_offset
         else:
             voltages = [_siglent_byte_to_voltage(byte, vdiv, offset) for byte in raw]
@@ -373,7 +395,10 @@ class SDS800XHDTcpAdapter:
         # --- 7. 元数据 ---
         wavedesc_info: dict[str, Any] = (
             {
-                "vertical_gain": wavedesc.vertical_gain,
+                "vertical_gain_vdiv": wavedesc.vertical_gain_vdiv,
+                "max_value": wavedesc.max_value,
+                "codes_per_div": wavedesc.codes_per_div,
+                "gain_v_per_code": wavedesc.gain_v_per_code,
                 "vertical_offset": wavedesc.vertical_offset,
                 "horiz_interval": wavedesc.horiz_interval,
                 "horiz_offset": wavedesc.horiz_offset,
