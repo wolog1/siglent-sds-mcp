@@ -16,15 +16,18 @@ from .uart_analyzer import analyze_uart_csv
 mcp = FastMCP("siglent-sds-mcp", json_response=True)
 
 _tcp: RawTcpTransport | None = None
-
-# 缓存上一次 connect_tcp 的参数，用于自动重连
 _tcp_host: str | None = None
 _tcp_port: int = 5025
 _tcp_timeout_s: float = 5.0
 
 
 @mcp.tool()
-def connect_tcp(host: str, port: int = 5025, timeout_s: float = 5.0, header_off: bool = True) -> dict[str, Any]:
+def connect_tcp(
+    host: str,
+    port: int = 5025,
+    timeout_s: float = 5.0,
+    header_off: bool = True,
+) -> dict[str, Any]:
     """Connect to the oscilloscope through raw TCP SCPI socket."""
 
     global _tcp, _tcp_host, _tcp_port, _tcp_timeout_s
@@ -135,9 +138,30 @@ def get_acquisition_status_tcp() -> dict[str, Any]:
 def measure_tcp(
     channel: Literal["C1", "C2", "C3", "C4"] = "C1",
     parameter: Literal[
-        "PKPK", "MAX", "MIN", "AMPL", "TOP", "BASE", "CMEAN", "MEAN", "RMS",
-        "CRMS", "OVSN", "FPRE", "OVSP", "RPRE", "PER", "FREQ", "PWID",
-        "NWID", "RISE", "FALL", "WID", "DUTY", "NDUTY", "ALL",
+        "PKPK",
+        "MAX",
+        "MIN",
+        "AMPL",
+        "TOP",
+        "BASE",
+        "CMEAN",
+        "MEAN",
+        "RMS",
+        "CRMS",
+        "OVSN",
+        "FPRE",
+        "OVSP",
+        "RPRE",
+        "PER",
+        "FREQ",
+        "PWID",
+        "NWID",
+        "RISE",
+        "FALL",
+        "WID",
+        "DUTY",
+        "NDUTY",
+        "ALL",
     ] = "PKPK",
 ) -> dict[str, Any]:
     """Take a measurement using SDS-style candidate commands."""
@@ -146,8 +170,11 @@ def measure_tcp(
 
 
 @mcp.tool()
-def screenshot_tcp(output_path: str | None = None, include_base64: bool = False) -> dict[str, Any]:
-    """Capture a screen image through candidate `SCDP` command and save raw image bytes."""
+def screenshot_tcp(
+    output_path: str | None = None,
+    include_base64: bool = False,
+) -> dict[str, Any]:
+    """Capture a screen image through candidate `SCDP` command."""
 
     return _tcp_adapter().screenshot(output_path=output_path, include_base64=include_base64)
 
@@ -167,7 +194,11 @@ def get_waveform_tcp(
         metadata_path=metadata_path,
         max_points=max_points,
     )
-    return {"csv_path": result.csv_path, "metadata_path": result.metadata_path, "metadata": result.metadata}
+    return {
+        "csv_path": result.csv_path,
+        "metadata_path": result.metadata_path,
+        "metadata": result.metadata,
+    }
 
 
 @mcp.tool()
@@ -188,7 +219,14 @@ def capture_uart_2mbps_tcp(
 @mcp.tool()
 def auto_find_waveform_tcp(
     channels: list[Literal["C1", "C2", "C3", "C4"]] | None = None,
-    signal_hint: Literal["unknown", "uart", "rs485", "modbus", "pwm", "clock"] = "unknown",
+    signal_hint: Literal[
+        "unknown",
+        "uart",
+        "rs485",
+        "modbus",
+        "pwm",
+        "clock",
+    ] = "unknown",
     coarse_timebase: str = "1MS",
     initial_vdiv: str = "1V",
     max_points: int = 2000,
@@ -198,7 +236,7 @@ def auto_find_waveform_tcp(
     leave_stopped: bool = True,
     set_trigger_level: bool = False,
 ) -> dict[str, object]:
-    """Automatically find, auto-range and leave an active waveform visible on screen."""
+    """Automatically find, auto-range and leave an active waveform visible."""
 
     result = auto_find_waveform(
         _tcp_adapter(),
@@ -247,7 +285,7 @@ def modbus_rtu_timing(
     parity: Literal["N", "E", "O"] = "N",
     stop_bits: int = 1,
 ) -> dict[str, object]:
-    """Calculate Modbus RTU character time and 1.5/3.5 character silence intervals."""
+    """Calculate Modbus RTU character time and silence intervals."""
 
     return calculate_modbus_rtu_timing(
         baudrate=baudrate,
@@ -306,13 +344,14 @@ def project_status() -> dict[str, Any]:
             "SCDP screen capture returning BMP/raw image bytes",
             "WF? DAT2 waveform data read with WFSU SP,1,NP,0,FP,0",
             "WF? DESC WAVEDESC descriptor read and adaptive decode",
-            "TRMD AUTO + wait + STOP acquisition sequence for readable waveform memory",
+            "TRMD AUTO + wait + STOP acquisition sequence",
             "min/max envelope waveform CSV export",
             "auto_find_waveform_tcp can capture an active signal and return final_stats",
         ],
         "known_issues": [
-            "C?:TRLV trigger-level command may not take effect on firmware 4.8.12.1.1.6.5; auto-find does not send trigger level by default.",
-            "Slow timebase waveform capture currently waits max(tdiv*20, 0.2s); add a capped wait after slow-timebase field behavior is verified.",
+            "C?:TRLV may not take effect on firmware 4.8.12.1.1.6.5; "
+            "auto-find does not send trigger level by default.",
+            "Slow timebase waveform capture currently waits max(tdiv*20, 0.2s).",
         ],
         "default_auto_find_behavior": {
             "leave_stopped": True,
@@ -340,7 +379,7 @@ def project_status() -> dict[str, Any]:
             "modbus_rtu_timing",
             "generate_report",
         ],
-        "status_note": "Hardware-tested alpha: core SDS824X HD capture path works; auto-find now defaults to holding the final stopped frame on screen.",
+        "status_note": "Hardware-tested alpha; auto-find defaults to holding final frame.",
     }
 
 
