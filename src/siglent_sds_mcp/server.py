@@ -32,7 +32,6 @@ def connect_tcp(host: str, port: int = 5025, timeout_s: float = 5.0, header_off:
         _tcp.close()
     _tcp = RawTcpTransport(host=host, port=port, timeout_s=timeout_s)
     _tcp.connect()
-    # 连接成功后持久化参数，供自动重连使用
     _tcp_host = host
     _tcp_port = port
     _tcp_timeout_s = timeout_s
@@ -50,7 +49,7 @@ def disconnect_tcp() -> dict[str, Any]:
     if _tcp is not None:
         _tcp.close()
         _tcp = None
-    _tcp_host = None  # 清除缓存，禁止自动重连
+    _tcp_host = None
     return {"ok": True}
 
 
@@ -136,30 +135,9 @@ def get_acquisition_status_tcp() -> dict[str, Any]:
 def measure_tcp(
     channel: Literal["C1", "C2", "C3", "C4"] = "C1",
     parameter: Literal[
-        "PKPK",
-        "MAX",
-        "MIN",
-        "AMPL",
-        "TOP",
-        "BASE",
-        "CMEAN",
-        "MEAN",
-        "RMS",
-        "CRMS",
-        "OVSN",
-        "FPRE",
-        "OVSP",
-        "RPRE",
-        "PER",
-        "FREQ",
-        "PWID",
-        "NWID",
-        "RISE",
-        "FALL",
-        "WID",
-        "DUTY",
-        "NDUTY",
-        "ALL",
+        "PKPK", "MAX", "MIN", "AMPL", "TOP", "BASE", "CMEAN", "MEAN", "RMS",
+        "CRMS", "OVSN", "FPRE", "OVSP", "RPRE", "PER", "FREQ", "PWID",
+        "NWID", "RISE", "FALL", "WID", "DUTY", "NDUTY", "ALL",
     ] = "PKPK",
 ) -> dict[str, Any]:
     """Take a measurement using SDS-style candidate commands."""
@@ -215,8 +193,12 @@ def auto_find_waveform_tcp(
     initial_vdiv: str = "1V",
     max_points: int = 2000,
     noise_floor_v: float = 0.05,
+    probe: float = 10.0,
+    refine_attempts: int = 3,
+    leave_stopped: bool = True,
+    set_trigger_level: bool = False,
 ) -> dict[str, object]:
-    """Automatically find an active waveform, auto-range display, then capture artifacts."""
+    """Automatically find, auto-range and leave an active waveform visible on screen."""
 
     result = auto_find_waveform(
         _tcp_adapter(),
@@ -226,6 +208,10 @@ def auto_find_waveform_tcp(
         initial_vdiv=initial_vdiv,
         max_points=max_points,
         noise_floor_v=noise_floor_v,
+        probe=probe,
+        refine_attempts=refine_attempts,
+        leave_stopped=leave_stopped,
+        set_trigger_level=set_trigger_level,
     )
     return result.to_dict()
 
@@ -322,13 +308,19 @@ def project_status() -> dict[str, Any]:
             "WF? DESC WAVEDESC descriptor read and adaptive decode",
             "TRMD AUTO + wait + STOP acquisition sequence for readable waveform memory",
             "min/max envelope waveform CSV export",
-            "auto_find_waveform_tcp found active signal and returned final_stats",
+            "auto_find_waveform_tcp can capture an active signal and return final_stats",
         ],
         "known_issues": [
-            "C?:TRLV trigger-level command may not take effect on firmware 4.8.12.1.1.6.5; AUTO-mode display still works, but stable trigger-level control needs follow-up.",
-            "OFST=vmean display-centering direction remains marked needs_hardware_validation until checked with a known 3.3V square wave.",
-            "Long timebase waveform capture currently waits max(tdiv*20, 0.2s); add a capped wait once slow-timebase field behavior is verified.",
+            "C?:TRLV trigger-level command may not take effect on firmware 4.8.12.1.1.6.5; auto-find does not send trigger level by default.",
+            "Slow timebase waveform capture currently waits max(tdiv*20, 0.2s); add a capped wait after slow-timebase field behavior is verified.",
         ],
+        "default_auto_find_behavior": {
+            "leave_stopped": True,
+            "screen_hold": "scope remains stopped on final visible frame",
+            "set_trigger_level": False,
+            "probe": 10.0,
+            "refine_attempts": 3,
+        },
         "tcp_tools": [
             "connect_tcp",
             "disconnect_tcp",
@@ -348,30 +340,20 @@ def project_status() -> dict[str, Any]:
             "modbus_rtu_timing",
             "generate_report",
         ],
-        "status_note": "Hardware-tested alpha: core SDS824X HD capture path works, with known follow-up items around trigger-level SCPI and offset-direction validation.",
+        "status_note": "Hardware-tested alpha: core SDS824X HD capture path works; auto-find now defaults to holding the final stopped frame on screen.",
     }
 
 
 def _require_tcp() -> RawTcpTransport:
-    """返回已连接的 RawTcpTransport，必要时自动重连。
-
-    自动重连策略：
-      - 若全局 _tcp 为 None 且没有缓存的连接参数 → 抛出错误（从未连接过）。
-      - 若套接字对象存在但底层连接已断（SCPI 指令超时/仪器重启）→ 尝试重建连接。
-      - 若缓存了连接参数但 _tcp 为 None → 同样尝试重建。
-    重建失败时抛出 RuntimeError，说明仪器不可达。
-    """
+    """返回已连接的 RawTcpTransport，必要时自动重连。"""
     global _tcp
     if _tcp_host is None:
-        # 从未成功调用过 connect_tcp
         raise RuntimeError("not connected; call connect_tcp first")
     if _tcp is None or not _tcp.is_connected():
-        # 套接字已断开（MCP 进程重启、仪器断电重启等场景）→ 自动重建
         try:
             transport = RawTcpTransport(host=_tcp_host, port=_tcp_port, timeout_s=_tcp_timeout_s)
             transport.connect()
             _tcp = transport
-            # 重连成功后发送 CHDR OFF，避免响应头污染后续查询
             try:
                 _tcp.write("CHDR OFF")
             except Exception:  # noqa: BLE001
