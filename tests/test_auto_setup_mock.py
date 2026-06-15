@@ -65,7 +65,11 @@ class TestAutoSetupMock:
             return _make_waveform_result(path)
 
         mock_scope.get_waveform.side_effect = fake_get_waveform
-        mock_scope.screenshot.return_value = {"path": str(tmp_path / "shot.bmp"), "bytes": 1000, "framing": "raw-bmp"}
+        mock_scope.screenshot.return_value = {
+            "path": str(tmp_path / "shot.bmp"),
+            "bytes": 1000,
+            "framing": "raw-bmp",
+        }
         mock_scope.get_channel.return_value = {"channel": "C1", "trace": "ON"}
         mock_scope.get_acquisition_status.return_value = {"trigger_mode": "STOP"}
 
@@ -119,11 +123,16 @@ class TestAutoSetupMock:
         assert result.found is True
         assert result.coarse_stats is not None
         assert result.final_stats is not None
-        assert result.offset_direction_status == "verified_on_sds824xhd: display_offset_uses_waveform_mean"
+        assert result.offset_direction_status == (
+            "verified_on_sds824xhd: display_offset_uses_waveform_mean"
+        )
         assert float(result.coarse_stats["v_pp"]) > 4.0
         assert float(result.final_stats["v_pp"]) > 4.0
 
-    def test_uart_hint_selects_neg_slope_without_trigger_level_by_default(self, tmp_path: Path) -> None:
+    def test_uart_hint_selects_neg_slope_without_trigger_level_by_default(
+        self,
+        tmp_path: Path,
+    ) -> None:
         c1_path = _write_wave_csv(
             tmp_path / "uart.csv",
             [3.3 if (i // 8) % 2 == 0 else 0.0 for i in range(160)],
@@ -141,7 +150,11 @@ class TestAutoSetupMock:
         )
 
         assert result.found is True
-        acq_calls = [c for c in mock_scope.configure_acquisition.call_args_list if "trigger_slope" in c.kwargs]
+        acq_calls = [
+            c
+            for c in mock_scope.configure_acquisition.call_args_list
+            if "trigger_slope" in c.kwargs
+        ]
         assert any(c.kwargs.get("trigger_slope") == "NEG" for c in acq_calls)
         assert all(c.kwargs.get("trigger_level") is None for c in acq_calls)
         assert result.trigger_level_command_sent is False
@@ -194,7 +207,11 @@ class TestAutoSetupMock:
         final_wf_call = mock_scope.get_waveform.call_args_list[-1]
         assert final_wf_call.kwargs.get("restore_trmd") is False
         mock_scope.screenshot.assert_called_once()
-        arm_calls = [c for c in mock_scope.transport.write.call_args_list if c.args and c.args[0] == "ARM"]
+        arm_calls = [
+            c
+            for c in mock_scope.transport.write.call_args_list
+            if c.args and c.args[0] == "ARM"
+        ]
         assert arm_calls == []
 
     def test_restart_after_capture_when_leave_stopped_false(self, tmp_path: Path) -> None:
@@ -215,7 +232,11 @@ class TestAutoSetupMock:
 
         assert result.leave_stopped is False
         assert result.screen_hold is False
-        arm_calls = [c for c in mock_scope.transport.write.call_args_list if c.args and c.args[0] == "ARM"]
+        arm_calls = [
+            c
+            for c in mock_scope.transport.write.call_args_list
+            if c.args and c.args[0] == "ARM"
+        ]
         assert len(arm_calls) >= 1
 
     def test_probe_parameter_is_applied(self, tmp_path: Path) -> None:
@@ -235,4 +256,7 @@ class TestAutoSetupMock:
         )
 
         assert result.probe == 1.0
-        assert any(c.kwargs.get("probe") == 1.0 for c in mock_scope.configure_channel.call_args_list)
+        assert any(
+            c.kwargs.get("probe") == 1.0
+            for c in mock_scope.configure_channel.call_args_list
+        )
