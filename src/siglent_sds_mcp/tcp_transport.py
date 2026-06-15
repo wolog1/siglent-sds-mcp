@@ -34,7 +34,7 @@ class RawTcpTransport:
         self.timeout_s = timeout_s
         self._socket: socket.socket | None = None
         self._lock = threading.RLock()
-        self._last_tail_bytes: bytes | None = None  # diagnostic: unexpected bytes after binary payload
+        self._last_tail_bytes: bytes | None = None  # diagnostic: unexpected bytes after payload
 
     def connect(self) -> None:
         with self._lock:
@@ -64,7 +64,6 @@ class RawTcpTransport:
         data = _normalize_command(command).encode("ascii") + b"\n"
         with self._lock:
             sock = self._require_socket()
-            # 发送前清空套接字中可能残留的过期响应字节，避免响应错位。
             self._flush_input(sock)
             sock.sendall(data)
             return self._read_line(sock).decode("utf-8", errors="replace").strip()
@@ -77,20 +76,14 @@ class RawTcpTransport:
             if timeout_s is not None:
                 sock.settimeout(timeout_s)
             try:
-                # 发送前清空残留字节，避免上一次响应污染本次读取。
                 self._flush_input(sock)
                 sock.sendall(data)
-                # SIGLENT 在二进制块前可能带有 ASCII 前缀（例如 "DAT2," 或
-                # "C1:WF DAT2,"）。需要跳过前缀，定位到真正的块起始标记：
-                #   - 截图 SCDP   : 以 "BM" 开头的原始 BMP
-                #   - 波形 WF? DAT2: 以 IEEE 488.2 "#<n><len>" 块开头
                 kind, marker = self._read_to_binary_marker(sock)
                 if kind == "bmp":
                     return BinaryBlock(data=self._read_raw_bmp(sock, marker), framing="raw-bmp")
                 if kind == "ieee":
                     return BinaryBlock(data=self._read_ieee4882_block(sock, marker), framing="ieee4882")
 
-                # 未识别响应：读取剩余内容用于诊断。
                 rest = self._read_until_timeout(sock)
                 return BinaryBlock(data=marker + rest, framing="unknown")
             finally:
@@ -103,12 +96,8 @@ class RawTcpTransport:
 
     @staticmethod
     def _flush_input(sock: socket.socket) -> bytes:
-        """非阻塞地丢弃套接字接收缓冲区中的残留字节。
+        """Non-blockingly discard stale bytes already sitting in the receive buffer."""
 
-        SIGLENT 的二进制响应（如 BMP 截图、WF 波形）后常带有一个收尾换行符，
-        若未读走会污染下一条查询，导致响应整体错位。发送新命令前调用本方法，
-        可彻底规避此类错位问题。返回被丢弃的字节，便于诊断。
-        """
         old_timeout = sock.gettimeout()
         sock.setblocking(False)
         drained: list[bytes] = []
@@ -125,11 +114,13 @@ class RawTcpTransport:
         return b"".join(drained)
 
     def _read_to_binary_marker(self, sock: socket.socket, max_prefix: int = 256) -> tuple[str, bytes]:
-        """跳过二进制块前的 ASCII 前缀，定位到块起始标记。
+        """Skip optional ASCII prefix and find binary response marker.
 
-        返回 (kind, marker)：kind 为 "bmp"/"ieee"/"unknown"，marker 为已读入的
-        起始字节（"BM" 或 "#"）。若超出 max_prefix 仍未找到标记，返回 unknown。
+        SIGLENT binary responses may be prefixed with text such as `DAT2,` or
+        `C1:WF DAT2,`. Return (`kind`, `marker`) where kind is `bmp`, `ieee`, or
+        `unknown`, and marker is the bytes already consumed for that marker.
         """
+
         buf = b""
         while len(buf) < max_prefix:
             ch = sock.recv(1)
@@ -180,20 +171,7 @@ class RawTcpTransport:
         except ValueError as exc:
             raise ScpiTcpError(f"invalid IEEE 488.2 length: {length_digits!r}") from exc
         payload = self._read_exact(sock, data_len)
-        # Consume trailing newline(s) — SIGLENT appends \n after binary blocks.
-        # Only consume actual newline bytes; if something else arrives, leave it
-        # in the socket buffer for the next read (do not silently discard).
-        try:
-            sock.settimeout(0.05)
-            tail = sock.recv(2)
-            if tail and tail not in (b"\n", b"\r\n"):
-                # Not a newline — put it back conceptually by logging.
-                # We cannot pushback to a TCP socket, so record for diagnostics.
-                self._last_tail_bytes = tail  # noqa: SLF001 — diagnostic-only store
-        except (TimeoutError, socket.timeout):
-            pass
-        finally:
-            sock.settimeout(self.timeout_s)
+        self._consume_binary_terminator(sock)
         return payload
 
     def _read_raw_bmp(self, sock: socket.socket, first: bytes) -> bytes:
@@ -204,37 +182,50 @@ class RawTcpTransport:
         if file_size <= 54 or file_size > 100_000_000:
             raise ScpiTcpError(f"invalid BMP file size: {file_size}")
         rest = self._read_exact(sock, file_size - len(header))
-        # Consume trailing newline(s) — SIGLENT appends \n after BMP data.
-        # Only consume actual newline bytes; unexpected bytes are recorded, not discarded.
-        try:
-            sock.settimeout(0.1)
-            tail = sock.recv(2)
-            if tail and tail not in (b"\n", b"\r\n"):
-                self._last_tail_bytes = tail  # noqa: SLF001 — diagnostic-only store
-        except (TimeoutError, socket.timeout):
-            pass
-        finally:
-            sock.settimeout(self.timeout_s)
+        self._consume_binary_terminator(sock, timeout_s=0.1)
         return header + rest
+
+    def _consume_binary_terminator(self, sock: socket.socket, timeout_s: float = 0.05) -> None:
+        """Consume only explicit binary response terminators: `\n` or `\r\n`.
+
+        Earlier versions called `recv(2)` after the payload. That solved SIGLENT's
+        trailing newline, but could also swallow the first bytes of the next response.
+        This function peeks first, then consumes only known newline terminators.
+        """
+
+        old_timeout = sock.gettimeout()
+        try:
+            sock.settimeout(timeout_s)
+            try:
+                pending = sock.recv(2, socket.MSG_PEEK)
+            except (BlockingIOError, TimeoutError, socket.timeout):
+                return
+            if not pending:
+                return
+            if pending.startswith(b"\r\n"):
+                _ = sock.recv(2)
+            elif pending.startswith(b"\n") or pending.startswith(b"\r"):
+                _ = sock.recv(1)
+            else:
+                self._last_tail_bytes = pending
+        finally:
+            sock.settimeout(old_timeout)
 
     @staticmethod
     def _read_until_timeout(sock: socket.socket) -> bytes:
-        """Read until timeout or EOF — drains trailing bytes after binary payload.
+        """Read until timeout or EOF."""
 
-        Returns all data read.  Break on timeout (no more data) or EOF (peer
-        closed gracefully).  Does NOT silently discard bytes.
-        """
         chunks: list[bytes] = []
         old_timeout = sock.gettimeout()
         sock.settimeout(0.2)
         try:
             while True:
                 chunk = sock.recv(4096)
-                if not chunk:  # EOF — peer closed connection
+                if not chunk:
                     break
                 chunks.append(chunk)
         except (TimeoutError, socket.timeout):
-            pass  # expected — no more data within timeout
+            pass
         finally:
             sock.settimeout(old_timeout)
         return b"".join(chunks)
