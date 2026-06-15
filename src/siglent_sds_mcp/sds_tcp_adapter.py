@@ -4,6 +4,8 @@ import base64
 import csv
 import struct
 import time
+
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -318,30 +320,67 @@ class SDS800XHDTcpAdapter:
         def _meas(param: MeasureParameter) -> float | None:
             return _parse_meas_value(self.measure(ch, param)["value"])
 
-        # --- Step 1: 宽量程粗测 DC 与 PKPK ---
+        def _poll_meas(param: MeasureParameter, n: int = 5, interval: float = 0.2) -> list[float]:
+            """轮询 n 次测量，过滤无效值（****），返回有效值列表。"""
+            vals: list[float] = []
+            for _ in range(n):
+                v = _meas(param)
+                if v is not None:
+                    vals.append(v)
+                time.sleep(interval)
+            return vals
+
+        def _wait_trigger(timeout: float = 2.0, poll_interval: float = 0.1) -> bool:
+            """轮询 SAST? 直到 Stop（触发完成）或超时。"""
+            waited = 0.0
+            while waited < timeout:
+                try:
+                    sast = self.transport.query("SAST?").strip()
+                    if sast in ("Stop", "Trig'd"):
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(poll_interval)
+                waited += poll_interval
+            return False
+
+        # --- Step 1: 宽量程粗测 DC 与 PKPK（多次采样取最大，应对间歇信号）---
         self.configure_channel(ch, vdiv="1V", offset="0V", coupling="D1M", trace=True)
-        self.transport.write("TRDL 0S")  # 清零触发延迟，避免采集窗口偏移
+        self.transport.write("TRDL 0S")
         self.configure_acquisition(
             command="run", trigger_mode="AUTO",
             trigger_source=ch, trigger_level="0.0000E+00", trigger_slope="POS",
         )
-        time.sleep(settle_s)
-        dc_v = _meas("MEAN") or 0.0
-        coarse_pkpk = _meas("PKPK") or 0.0
-        steps.append({"stage": "coarse", "dc_v": dc_v, "pkpk_v": coarse_pkpk})
+        _wait_trigger(timeout=settle_s)
+        # 多次采样取最大 PKPK（间歇信号可能在某次刚好出现）
+        pkpk_samples = _poll_meas("PKPK", n=5, interval=0.15)
+        coarse_pkpk = max(pkpk_samples) if pkpk_samples else 0.0
+        # MEAN 取中位数（比均值更抗异常值）
+        mean_samples = _poll_meas("MEAN", n=3, interval=0.1)
+        dc_v = float(np.median(mean_samples)) if mean_samples else 0.0
+        steps.append({
+            "stage": "coarse",
+            "dc_v": dc_v,
+            "pkpk_v": coarse_pkpk,
+            "pkpk_samples": pkpk_samples,
+            "mean_samples": mean_samples,
+        })
 
         # --- Step 2: 时基扫描定位 AC 分量 ---
-        # 先放大 VDIV 到合适量程（DC 居中），再逐档扫描时基测 PKPK。
+        # 使用面板 VDIV 覆盖粗测 PKPK，OFST 使信号居中（+dc_v 而非 -dc_v）
         probe_vdiv = _pick_vdiv(max(coarse_pkpk, 0.05))
-        self.configure_channel(ch, vdiv=_fmt_sci(probe_vdiv), offset=_fmt_sci(-dc_v))
+        # OFST = +dc_v：使信号中心对齐屏幕中心（实测 SDS 示波器 OFST 是目标位置）
+        probe_ofst = max(min(dc_v, probe_vdiv * 6), -probe_vdiv * 6)
+        self.configure_channel(ch, vdiv=_fmt_sci(probe_vdiv), offset=_fmt_sci(probe_ofst))
         best_tdiv: float | None = None
         scan: dict[float, float] = {}
         for tdiv in _TDIV_SCAN_S:
             self.configure_acquisition(timebase=_fmt_sci(tdiv), command="run", trigger_mode="AUTO")
-            time.sleep(settle_s * 0.7)
-            pk = _meas("PKPK") or 0.0
+            triggered = _wait_trigger(timeout=max(settle_s * 0.7, 0.5))
+            pk_samples = _poll_meas("PKPK", n=3, interval=0.1) if triggered else []
+            pk = max(pk_samples) if pk_samples else 0.0
             scan[tdiv] = pk
-            if pk > probe_vdiv * _AUTOSET_SIGNAL_FRAC:  # 超过设定阈值视为命中
+            if pk > probe_vdiv * _AUTOSET_SIGNAL_FRAC:
                 best_tdiv = tdiv
                 break
         if best_tdiv is None:
@@ -352,17 +391,23 @@ class SDS800XHDTcpAdapter:
             "scan": {f"{k:.2e}": v for k, v in scan.items()},
         })
 
-        # --- Step 3: 命中时基精测 ---
+        # --- Step 3: 命中时基精测（同样多次采样）---
         self.configure_acquisition(timebase=_fmt_sci(best_tdiv), command="run", trigger_mode="AUTO")
-        time.sleep(settle_s)
-        freq = _meas("FREQ")
-        per = _meas("PER")
-        pkpk = _meas("PKPK") or coarse_pkpk
-        vmax = _meas("MAX")
-        vmin = _meas("MIN")
-        vmean = _meas("MEAN")
-        if vmean is None:
-            vmean = dc_v
+        _wait_trigger(timeout=settle_s)
+        freq_samples = _poll_meas("FREQ", n=3, interval=0.1)
+        per_samples = _poll_meas("PER", n=3, interval=0.1)
+        pkpk_samples = _poll_meas("PKPK", n=3, interval=0.1)
+        vmax_samples = _poll_meas("MAX", n=3, interval=0.1)
+        vmin_samples = _poll_meas("MIN", n=3, interval=0.1)
+        vmean_samples = _poll_meas("MEAN", n=3, interval=0.1)
+
+        freq = float(np.median(freq_samples)) if freq_samples else None
+        per = float(np.median(per_samples)) if per_samples else None
+        pkpk = max(pkpk_samples) if pkpk_samples else coarse_pkpk
+        vmax = max(vmax_samples) if vmax_samples else None
+        vmin = min(vmin_samples) if vmin_samples else None
+        vmean = float(np.median(vmean_samples)) if vmean_samples else dc_v
+
         steps.append({
             "stage": "measure",
             "freq_hz": freq, "period_s": per, "pkpk_v": pkpk,
@@ -379,8 +424,7 @@ class SDS800XHDTcpAdapter:
         final_tdiv = _pick_tdiv(period_s, cycles=target_cycles) if period_s else best_tdiv
         final_vdiv = _pick_vdiv(max(pkpk, 0.01))
 
-        # 确保记录深度足够（≥ 100 点）。窄时基下 SARA 会自动降采样，
-        # 实测 SDS824X HD：5ns/div→25点，10ns→50点，20ns→100点（500MSa/s）。
+        # 记录深度保护
         sara_val = _parse_sample_rate(self.transport.query("SARA?"))
         while True:
             est_pts = int(sara_val * final_tdiv * _AUTOSET_DIVISIONS_H)
@@ -390,9 +434,9 @@ class SDS800XHDTcpAdapter:
             if idx + 1 >= len(_TDIV_STEPS_S):
                 break
             final_tdiv = _TDIV_STEPS_S[idx + 1]
-        # OFST 居中（钳位 ±6 格，避免超出有效偏移范围）
-        final_ofst = max(min(-vmean, final_vdiv * 6), -final_vdiv * 6)
-        # 触发电平：优先 (max+min)/2 中值，否则用均值
+
+        # OFST 居中：+vmean 使信号中心对齐屏幕中心
+        final_ofst = max(min(vmean, final_vdiv * 6), -final_vdiv * 6)
         trig_level = (vmax + vmin) / 2.0 if (vmax is not None and vmin is not None) else vmean
 
         self.configure_channel(ch, vdiv=_fmt_sci(final_vdiv), offset=_fmt_sci(final_ofst))
@@ -404,14 +448,15 @@ class SDS800XHDTcpAdapter:
             trigger_mode="AUTO",
             command="run",
         )
-        time.sleep(settle_s)
+        _wait_trigger(timeout=settle_s)
 
         # --- Step 5: 可选截图确认屏幕显示 ---
         shot: dict[str, Any] | None = None
         if screenshot_path is not None:
             shot = self.screenshot(screenshot_path)
 
-        signal_detected = period_s is not None and pkpk > final_vdiv * 0.2
+        # 信号检测：放宽条件，只要有明显 AC 分量（PKPK > 10% VDIV）即认为有信号
+        signal_detected = pkpk > final_vdiv * 0.1
         return {
             "channel": ch,
             "signal_detected": signal_detected,
