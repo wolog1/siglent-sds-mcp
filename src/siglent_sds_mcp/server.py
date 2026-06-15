@@ -8,7 +8,6 @@ from mcp.server.fastmcp import FastMCP
 from .modbus_timing import calculate_modbus_rtu_timing
 from .report import ReportInput, generate_markdown_report
 from .rs485_analyzer import analyze_rs485_pair_csv
-from .scope_driver import SiglentSDSDriver, UartCaptureSetup
 from .sds_tcp_adapter import SDS800XHDTcpAdapter
 from .tcp_transport import RawTcpTransport
 from .uart_analyzer import analyze_uart_csv
@@ -208,113 +207,6 @@ def capture_uart_2mbps_tcp(
 
 
 @mcp.tool()
-def scope_idn(resource: str, timeout_ms: int = 5000) -> dict[str, Any]:
-    """Connect through PyVISA and query *IDN?."""
-
-    scope = SiglentSDSDriver.connect(resource, timeout_ms=timeout_ms)
-    try:
-        return {"resource": resource, "idn": scope.idn()}
-    finally:
-        scope.close()
-
-
-@mcp.tool()
-def scope_run(resource: str, timeout_ms: int = 5000) -> dict[str, Any]:
-    """Start oscilloscope acquisition through PyVISA."""
-
-    scope = SiglentSDSDriver.connect(resource, timeout_ms=timeout_ms)
-    try:
-        scope.run()
-        return {"resource": resource, "state": "run"}
-    finally:
-        scope.close()
-
-
-@mcp.tool()
-def scope_stop(resource: str, timeout_ms: int = 5000) -> dict[str, Any]:
-    """Stop oscilloscope acquisition through PyVISA."""
-
-    scope = SiglentSDSDriver.connect(resource, timeout_ms=timeout_ms)
-    try:
-        scope.stop()
-        return {"resource": resource, "state": "stop"}
-    finally:
-        scope.close()
-
-
-@mcp.tool()
-def scope_single(resource: str, timeout_ms: int = 5000, wait_s: float = 0.5) -> dict[str, Any]:
-    """Run a single acquisition through PyVISA and wait briefly for completion."""
-
-    scope = SiglentSDSDriver.connect(resource, timeout_ms=timeout_ms)
-    try:
-        scope.single()
-        scope.wait_after_single(wait_s)
-        return {"resource": resource, "state": "single", "wait_s": wait_s}
-    finally:
-        scope.close()
-
-
-@mcp.tool()
-def scope_setup_uart(
-    resource: str,
-    channel: int = 1,
-    baudrate: int = 2_000_000,
-    logic_level: str = "3.3V TTL",
-    trigger_level_v: float = 1.5,
-    timeout_ms: int = 5000,
-) -> dict[str, Any]:
-    """Configure channel, timebase and edge trigger for UART waveform capture.
-
-    This PyVISA path remains a scaffold until SDS800X HD command syntax is verified.
-    """
-
-    scope = SiglentSDSDriver.connect(resource, timeout_ms=timeout_ms)
-    try:
-        setup = UartCaptureSetup(
-            channel=channel,
-            baudrate=baudrate,
-            logic_level=logic_level,
-            trigger_level_v=trigger_level_v,
-        )
-        return scope.setup_uart_capture(setup)
-    finally:
-        scope.close()
-
-
-@mcp.tool()
-def scope_measure_basic(resource: str, channel: int = 1, timeout_ms: int = 5000) -> dict[str, Any]:
-    """Read basic oscilloscope measurements for one channel through PyVISA."""
-
-    scope = SiglentSDSDriver.connect(resource, timeout_ms=timeout_ms)
-    try:
-        return scope.measure_basic(channel=channel)
-    finally:
-        scope.close()
-
-
-@mcp.tool()
-def scope_fetch_waveform(
-    resource: str,
-    channel: int = 1,
-    output_path: str = "artifacts/waveforms/ch1.csv",
-    max_points: int | None = None,
-    timeout_ms: int = 10000,
-) -> dict[str, Any]:
-    """Fetch waveform samples and write them to CSV.
-
-    Current implementation is a safe placeholder until SDS800X HD waveform SCPI is
-    verified against a real instrument.
-    """
-
-    scope = SiglentSDSDriver.connect(resource, timeout_ms=timeout_ms)
-    try:
-        return scope.fetch_waveform_csv(channel=channel, output_path=output_path, max_points=max_points)
-    finally:
-        scope.close()
-
-
-@mcp.tool()
 def analyze_uart_csv_file(csv_path: str, baudrate: int = 2_000_000) -> dict[str, Any]:
     """Analyze a two-column UART waveform CSV: time_s, voltage_v."""
 
@@ -393,13 +285,14 @@ def project_status() -> dict[str, Any]:
     """Return implementation status and verification boundary."""
 
     return {
-        "status": "candidate-implementation-ready-for-hardware-test",
+        "status": "verified-on-hardware",
         "target": "SIGLENT SDS824X HD / SDS800X HD",
-        "transport_priority": ["raw TCP socket, candidate port 5025", "PyVISA / USBTMC fallback"],
+        "transport": "raw TCP SCPI socket, port 5025",
         "tcp_tools": [
             "connect_tcp",
             "disconnect_tcp",
             "identify_tcp",
+            "safe_scpi_query_tcp",
             "get_channel_tcp",
             "configure_channel_tcp",
             "configure_acquisition_tcp",
@@ -413,7 +306,7 @@ def project_status() -> dict[str, Any]:
             "modbus_rtu_timing",
             "generate_report",
         ],
-        "status_note": "TCP tools use SDS-style candidate commands adapted from upstream reference; SDS824X HD hardware validation still required.",
+        "status_note": "经 SDS824X HD 真机验证。WAVEDESC 自适应解码，自动重连，min/max 包络抽样。",
     }
 
 

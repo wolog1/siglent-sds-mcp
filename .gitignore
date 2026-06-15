@@ -30,6 +30,8 @@ restart_mcp.sh
 smart_waveform_capture.py
 test_waveform.sh
 waveform_display.py
+/tmp/auto_probe*.py
+/tmp/full_verify*.py
 
 # 备份文件
 *.bak
@@ -43,7 +45,17 @@ verify_*.json
 verify_*.png
 mcp_verify_*.csv
 mcp_verify_*.png
+mcp_verify_*.json
 cap*.png
+probe*.png
+probe*.csv
+probe*.json
+final_*.png
+final_*.csv
+final_*.json
+*_shot.png
+*_wave.csv
+*_wave.json
 
 # 日志
 *.log
