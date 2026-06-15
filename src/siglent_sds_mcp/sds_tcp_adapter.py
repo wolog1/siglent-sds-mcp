@@ -135,6 +135,31 @@ MeasureParameter = Literal[
 ]
 
 
+# ---------------------------------------------------------------------------
+# 自动量程（auto_setup）档位表 —— 配置驱动，避免硬编码魔术数字。
+# 取值参照 SDS800X HD 面板可选档位（1-2-5 序列）。
+# ---------------------------------------------------------------------------
+_VDIV_STEPS_V: tuple[float, ...] = (
+    5e-3, 10e-3, 20e-3, 50e-3, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0,
+)
+_TDIV_STEPS_S: tuple[float, ...] = (
+    1e-9, 2e-9, 5e-9, 10e-9, 20e-9, 50e-9,
+    100e-9, 200e-9, 500e-9,
+    1e-6, 2e-6, 5e-6, 10e-6, 20e-6, 50e-6,
+    100e-6, 200e-6, 500e-6,
+    1e-3, 2e-3, 5e-3, 10e-3, 20e-3,
+)
+# 时基扫描序列：先中等粗到极粗（捕获慢信号），再由粗到细（捕获高频）。
+# 解决高频信号在宽时基下因欠采样被测量为"直流"的问题。
+_TDIV_SCAN_S: tuple[float, ...] = (
+    5e-6, 50e-6, 500e-6, 5e-3, 50e-3, 1e-6, 200e-9, 50e-9, 10e-9,
+)
+# auto_setup 默认参数
+_AUTOSET_DIVISIONS_V = 6.0    # 垂直方向期望信号占据的格数
+_AUTOSET_DIVISIONS_H = 14.0   # 水平方向总格数（SDS800X HD 屏幕宽度）
+_AUTOSET_SIGNAL_FRAC = 0.5    # 扫描时判定"有信号"的阈值（占 VDIV 的比例）
+
+
 @dataclass(slots=True)
 class WaveformResult:
     csv_path: str
@@ -260,6 +285,154 @@ class SDS800XHDTcpAdapter:
         time.sleep(0.2)
         value = self.transport.query(f"{ch}:PAVA? {parameter}")
         return {"channel": ch, "parameter": parameter, "value": value}
+
+    def auto_setup(
+        self,
+        channel: Channel = "C1",
+        *,
+        target_cycles: float = 4.0,
+        settle_s: float = 0.6,
+        screenshot_path: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """自动探测信号并把波形调整到屏幕最佳显示（类似面板 Auto Setup）。
+
+        经 SDS824X HD 真机验证的探测流程：
+          1. 宽量程（1V/div, OFST=0）粗测 DC 电平与 PKPK；
+          2. 时基扫描定位 AC 分量——解决高频信号在宽时基下因欠采样被
+             测量为"直流"的问题（实测 62MHz 信号在 5µs/div 时 PKPK≈0，
+             在 50µs/div 时 PKPK 跳到 85mV）；
+          3. 在命中时基精测 FREQ/PER/PKPK/MAX/MIN；
+          4. 据此选 VDIV（PKPK 占 ~6 格）、OFST（DC 居中）、
+             TDIV（显示 target_cycles 个周期）、触发电平（信号中值）；
+          5. 可选截图确认最终屏幕显示。
+
+        参数:
+            channel: 目标通道。
+            target_cycles: 最终时基期望显示的完整周期数。
+            settle_s: 每次配置变更后等待采集稳定的时间（秒）。
+            screenshot_path: 若提供则在完成后截图保存到该路径。
+        """
+        ch = _channel(channel)
+        steps: list[dict[str, Any]] = []
+
+        def _meas(param: MeasureParameter) -> float | None:
+            return _parse_meas_value(self.measure(ch, param)["value"])
+
+        # --- Step 1: 宽量程粗测 DC 与 PKPK ---
+        self.configure_channel(ch, vdiv="1V", offset="0V", coupling="D1M", trace=True)
+        self.transport.write("TRDL 0S")  # 清零触发延迟，避免采集窗口偏移
+        self.configure_acquisition(
+            command="run", trigger_mode="AUTO",
+            trigger_source=ch, trigger_level="0.0000E+00", trigger_slope="POS",
+        )
+        time.sleep(settle_s)
+        dc_v = _meas("MEAN") or 0.0
+        coarse_pkpk = _meas("PKPK") or 0.0
+        steps.append({"stage": "coarse", "dc_v": dc_v, "pkpk_v": coarse_pkpk})
+
+        # --- Step 2: 时基扫描定位 AC 分量 ---
+        # 先放大 VDIV 到合适量程（DC 居中），再逐档扫描时基测 PKPK。
+        probe_vdiv = _pick_vdiv(max(coarse_pkpk, 0.05))
+        self.configure_channel(ch, vdiv=_fmt_sci(probe_vdiv), offset=_fmt_sci(-dc_v))
+        best_tdiv: float | None = None
+        scan: dict[float, float] = {}
+        for tdiv in _TDIV_SCAN_S:
+            self.configure_acquisition(timebase=_fmt_sci(tdiv), command="run", trigger_mode="AUTO")
+            time.sleep(settle_s * 0.7)
+            pk = _meas("PKPK") or 0.0
+            scan[tdiv] = pk
+            if pk > probe_vdiv * _AUTOSET_SIGNAL_FRAC:  # 超过设定阈值视为命中
+                best_tdiv = tdiv
+                break
+        if best_tdiv is None:
+            best_tdiv = max(scan, key=lambda k: scan[k]) if scan else 5e-6
+        steps.append({
+            "stage": "tdiv_scan",
+            "hit_tdiv_s": best_tdiv,
+            "scan": {f"{k:.2e}": v for k, v in scan.items()},
+        })
+
+        # --- Step 3: 命中时基精测 ---
+        self.configure_acquisition(timebase=_fmt_sci(best_tdiv), command="run", trigger_mode="AUTO")
+        time.sleep(settle_s)
+        freq = _meas("FREQ")
+        per = _meas("PER")
+        pkpk = _meas("PKPK") or coarse_pkpk
+        vmax = _meas("MAX")
+        vmin = _meas("MIN")
+        vmean = _meas("MEAN")
+        if vmean is None:
+            vmean = dc_v
+        steps.append({
+            "stage": "measure",
+            "freq_hz": freq, "period_s": per, "pkpk_v": pkpk,
+            "max_v": vmax, "min_v": vmin, "mean_v": vmean,
+        })
+
+        # --- Step 4: 计算并应用最终设置 ---
+        period_s: float | None = None
+        if per is not None and per > 0:
+            period_s = per
+        elif freq is not None and freq > 0:
+            period_s = 1.0 / freq
+
+        final_tdiv = _pick_tdiv(period_s, cycles=target_cycles) if period_s else best_tdiv
+        final_vdiv = _pick_vdiv(max(pkpk, 0.01))
+
+        # 确保记录深度足够（≥ 100 点）。窄时基下 SARA 会自动降采样，
+        # 实测 SDS824X HD：5ns/div→25点，10ns→50点，20ns→100点（500MSa/s）。
+        sara_val = _parse_sample_rate(self.transport.query("SARA?"))
+        while True:
+            est_pts = int(sara_val * final_tdiv * _AUTOSET_DIVISIONS_H)
+            if est_pts >= 100:
+                break
+            idx = _TDIV_STEPS_S.index(final_tdiv)
+            if idx + 1 >= len(_TDIV_STEPS_S):
+                break
+            final_tdiv = _TDIV_STEPS_S[idx + 1]
+        # OFST 居中（钳位 ±6 格，避免超出有效偏移范围）
+        final_ofst = max(min(-vmean, final_vdiv * 6), -final_vdiv * 6)
+        # 触发电平：优先 (max+min)/2 中值，否则用均值
+        trig_level = (vmax + vmin) / 2.0 if (vmax is not None and vmin is not None) else vmean
+
+        self.configure_channel(ch, vdiv=_fmt_sci(final_vdiv), offset=_fmt_sci(final_ofst))
+        self.configure_acquisition(
+            timebase=_fmt_sci(final_tdiv),
+            trigger_source=ch,
+            trigger_level=_fmt_sci(trig_level),
+            trigger_slope="POS",
+            trigger_mode="AUTO",
+            command="run",
+        )
+        time.sleep(settle_s)
+
+        # --- Step 5: 可选截图确认屏幕显示 ---
+        shot: dict[str, Any] | None = None
+        if screenshot_path is not None:
+            shot = self.screenshot(screenshot_path)
+
+        signal_detected = period_s is not None and pkpk > final_vdiv * 0.2
+        return {
+            "channel": ch,
+            "signal_detected": signal_detected,
+            "final_settings": {
+                "vdiv_v": final_vdiv,
+                "offset_v": final_ofst,
+                "tdiv_s": final_tdiv,
+                "trigger_level_v": trig_level,
+                "trigger_slope": "POS",
+            },
+            "measurements": {
+                "frequency_hz": freq,
+                "period_s": period_s,
+                "pkpk_v": pkpk,
+                "max_v": vmax,
+                "min_v": vmin,
+                "mean_v": vmean,
+            },
+            "probe_steps": steps,
+            "screenshot": shot,
+        }
 
     def screenshot(
         self,
@@ -532,6 +705,46 @@ def _channel(channel: str) -> Channel:
     if channel not in {"C1", "C2", "C3", "C4"}:
         raise ValueError("channel must be C1, C2, C3, or C4")
     return channel  # type: ignore[return-value]
+
+
+def _pick_vdiv(pkpk_v: float, *, divisions: float = _AUTOSET_DIVISIONS_V) -> float:
+    """选最小的、能在 divisions 格内容纳 pkpk 幅度的 VDIV 档。"""
+    if pkpk_v <= 0:
+        return _VDIV_STEPS_V[2]  # 默认 20mV/div
+    needed = pkpk_v / divisions
+    for v in _VDIV_STEPS_V:
+        if v >= needed * 0.9:
+            return v
+    return _VDIV_STEPS_V[-1]
+
+
+def _pick_tdiv(period_s: float, *, cycles: float = 4.0, divisions: float = _AUTOSET_DIVISIONS_H) -> float:
+    """选最小的、能显示 cycles 个完整周期（divisions 格）的 TDIV 档。"""
+    if period_s <= 0:
+        return _TDIV_STEPS_S[11]  # 默认 5µs/div
+    needed = period_s * cycles / divisions
+    for t in _TDIV_STEPS_S:
+        if t >= needed * 0.9:
+            return t
+    return _TDIV_STEPS_S[-1]
+
+
+def _parse_meas_value(raw: str) -> float | None:
+    """从 measure() 返回值解析数值。无效测量（含 '****'）返回 None。
+
+    measure() 返回形如 {"value": "PKPK,2.04E-02"}，取逗号后数值。
+    """
+    if "****" in raw:
+        return None
+    try:
+        return float(raw.split(",")[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _fmt_sci(value: float) -> str:
+    """格式化为示波器接受的科学计数法（4 位有效数字）。"""
+    return f"{value:.4E}"
 
 
 def _parse_voltage(value: str) -> float:

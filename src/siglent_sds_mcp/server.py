@@ -170,6 +170,28 @@ def measure_tcp(
 
 
 @mcp.tool()
+def auto_setup_tcp(
+    channel: Literal["C1", "C2", "C3", "C4"] = "C1",
+    target_cycles: float = 4.0,
+    settle_s: float = 0.6,
+    screenshot_path: str | None = None,
+) -> dict[str, Any]:
+    """自动探测信号并把波形调整到屏幕最佳显示（类似面板 Auto Setup）。
+
+    流程：宽量程粗测 → 时基扫描定位 AC → 精测频率/幅度 →
+    设置最佳 VDIV/OFST/TDIV/触发电平 → 可选截图。
+    适用于信号被当前量程/时基/触发设置"盖住"看不到的场景。
+    """
+
+    return _tcp_adapter().auto_setup(
+        channel=channel,
+        target_cycles=target_cycles,
+        settle_s=settle_s,
+        screenshot_path=screenshot_path,
+    )
+
+
+@mcp.tool()
 def screenshot_tcp(
     output_path: str | None = None,
     include_base64: bool = False,
@@ -370,6 +392,7 @@ def project_status() -> dict[str, Any]:
             "configure_acquisition_tcp",
             "get_acquisition_status_tcp",
             "measure_tcp",
+            "auto_setup_tcp",
             "screenshot_tcp",
             "get_waveform_tcp",
             "capture_uart_2mbps_tcp",
