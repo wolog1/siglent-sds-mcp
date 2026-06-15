@@ -309,10 +309,16 @@ class SDS800XHDTcpAdapter:
         tdiv = _parse_time(tdiv_raw)
         sample_rate = _parse_sample_rate(sara_raw)
 
-        # --- 2. 停止采集以确保波形内存可读 ---
-        # SDS824X HD 在 AUTO/NORM/SINGLE 模式下运行时 WF? DAT2 可能返回 0 字节；
-        # 必须先 STOP 让采集引擎暂停，波形数据才能被可靠读取。
+        # --- 2. 确保波形内存与当前 VDIV/OFST/TDIV 匹配 ---
+        # 仅 STOP 可能捕获到旧设置下的波形数据（WAVEDESC 内嵌 gain 与 VDIV?
+        # 不一致）。不能使用 ARM——ARM 会重置采集到"待触发"状态，在 AUTO 模式
+        # 下不保证立即触发完成。正确做法：利用 AUTO 模式的自动触发，等待至少
+        # 一帧完整采集后 STOP。
         prev_trmd = self.transport.query("TRMD?")
+        # 确保 AUTO 模式已运行并完成至少一帧采集。
+        self.transport.write("TRMD AUTO")
+        sweep_estimate = max(tdiv * 20.0, 0.2)  # 至少 200ms
+        time.sleep(sweep_estimate)
         self.transport.write("STOP")
 
         # --- 3. 下载原始波形数据（必须在 DESC 之前，否则 DAT2 返回 0 字节）---
@@ -339,14 +345,26 @@ class SDS800XHDTcpAdapter:
         # WAVEDESC 解码：voltage = code × gain_v_per_code - VERTICAL_OFFSET
         #   gain_v_per_code = VDIV / (MAX_VALUE / 256) = VDIV / codes_per_div
         # Fallback 公式：voltage = code × (vdiv / CODES_PER_DIV) - offset
+        #
+        # 交叉验证：若 WAVEDESC 内嵌的 VERTICAL_GAIN 与当前 VDIV? 偏差超过 5%，
+        # 说明 WAVEDESC 来自旧采集设置，回退到 VDIV?/OFST? 解码。
+        wavedesc_vdiv_mismatch = False
         if wavedesc is not None and wavedesc.gain_v_per_code != 0.0:
-            voltages = [
-                _siglent_byte_to_voltage_gain(byte, wavedesc.gain_v_per_code, wavedesc.vertical_offset)
-                for byte in raw
-            ]
-            decode_source = "wavedesc"
-            gain_used = wavedesc.gain_v_per_code
-            offset_used = wavedesc.vertical_offset
+            desc_vdiv = wavedesc.vertical_gain_vdiv
+            if vdiv > 0 and abs(desc_vdiv - vdiv) / vdiv > 0.05:
+                wavedesc_vdiv_mismatch = True
+                voltages = [_siglent_byte_to_voltage(byte, vdiv, offset) for byte in raw]
+                decode_source = "fallback_codes_per_div__wavedesc_vdiv_mismatch"
+                gain_used = vdiv / CODES_PER_DIV
+                offset_used = offset
+            else:
+                voltages = [
+                    _siglent_byte_to_voltage_gain(byte, wavedesc.gain_v_per_code, wavedesc.vertical_offset)
+                    for byte in raw
+                ]
+                decode_source = "wavedesc"
+                gain_used = wavedesc.gain_v_per_code
+                offset_used = wavedesc.vertical_offset
         else:
             voltages = [_siglent_byte_to_voltage(byte, vdiv, offset) for byte in raw]
             decode_source = "fallback_codes_per_div"
@@ -457,6 +475,7 @@ class SDS800XHDTcpAdapter:
                 "vertical_offset_v": offset_used,
                 "time_source": time_source,
                 "codes_per_div_fallback": CODES_PER_DIV,
+                "wavedesc_vdiv_mismatch": wavedesc_vdiv_mismatch,
             },
             "binary": {"bytes": len(raw), "framing": block.framing},
             "points": {
