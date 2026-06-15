@@ -302,32 +302,38 @@ class SDS800XHDTcpAdapter:
         tdiv_raw = self.transport.query("TDIV?")
         sara_raw = self.transport.query("SARA?")
 
-        vdiv = _parse_number_with_units(vdiv_raw)
-        offset = _parse_number_with_units(ofst_raw)
-        tdiv = _parse_number_with_units(tdiv_raw)
+        vdiv = _parse_voltage(vdiv_raw)
+        offset = _parse_voltage(ofst_raw)
+        tdiv = _parse_time(tdiv_raw)
         sample_rate = _parse_sample_rate(sara_raw)
 
-        # --- 2. 尝试获取 WAVEDESC 描述符（自适应解码的关键数据源）---
+        # --- 2. 停止采集以确保波形内存可读 ---
+        # SDS824X HD 在 AUTO/NORM/SINGLE 模式下运行时 WF? DAT2 可能返回 0 字节；
+        # 必须先 STOP 让采集引擎暂停，波形数据才能被可靠读取。
+        prev_trmd = self.transport.query("TRMD?")
+        self.transport.write("STOP")
+
+        # --- 3. 下载原始波形数据（必须在 DESC 之前，否则 DAT2 返回 0 字节）---
+        # WFSU SP,1：SP=0 会被 SDS824X HD scope 拒绝（scope 保持 SP=1），必须设为 >=1。
+        self.transport.write("WFSU SP,1,NP,0,FP,0")
+        block = self.transport.query_binary(f"{ch}:WF? DAT2", timeout_s=30.0)
+
+        # --- 4. 尝试获取 WAVEDESC 描述符（自适应解码的关键数据源）---
+        # DAT2 读取不会消耗 WAVEDESC 数据，DESC 仍可正常获取。
         # SIGLENT 响应格式为：<ch>:WF DESC,#<n><len><descriptor_bytes>
-        # 通过 query_binary 统一读取 IEEE 488.2 块，再搜索 WAVEDESC 标记解析。
         wavedesc: WaveDescriptor | None = None
         desc_error: str | None = None
         try:
-            self.transport.write("WFSU SP,0,NP,0,FP,0")
             desc_block = self.transport.query_binary(f"{ch}:WF? DESC", timeout_s=10.0)
             wavedesc = _parse_wavedesc(desc_block.data)
             if wavedesc is None:
                 desc_error = "parse_failed: WAVEDESC signature not found or sanity check failed"
         except Exception as exc:  # noqa: BLE001 - WAVEDESC 不可用时安全降级
             desc_error = f"query_failed: {exc!r}"
-
-        # --- 3. 下载原始波形数据 ---
-        self.transport.write("WFSU SP,0,NP,0,FP,0")
-        block = self.transport.query_binary(f"{ch}:WF? DAT2", timeout_s=30.0)
         raw = block.data
         total_points = len(raw)
 
-        # --- 4. 电压解码：优先 WAVEDESC，fallback 到 CODES_PER_DIV 常量 ---
+        # --- 5. 电压解码：优先 WAVEDESC，fallback 到 CODES_PER_DIV 常量 ---
         # WAVEDESC 解码：voltage = code × gain_v_per_code - VERTICAL_OFFSET
         #   gain_v_per_code = VDIV / (MAX_VALUE / 256) = VDIV / codes_per_div
         # Fallback 公式：voltage = code × (vdiv / CODES_PER_DIV) - offset
@@ -345,7 +351,7 @@ class SDS800XHDTcpAdapter:
             gain_used = vdiv / CODES_PER_DIV
             offset_used = offset
 
-        # --- 5. 时间轴定标：优先 WAVEDESC，fallback 到 SARA/触发居中 ---
+        # --- 6. 时间轴定标：优先 WAVEDESC，fallback 到 SARA/触发居中 ---
         # WAVEDESC 提供精确的 HORIZ_INTERVAL 和 HORIZ_OFFSET。
         # HORIZ_OFFSET：触发点相对于首采样点的时间偏移（s）。
         #   首点时间 = -HORIZ_OFFSET（即触发前记录长度，符号与示波器惯例一致）。
@@ -363,7 +369,7 @@ class SDS800XHDTcpAdapter:
             start_time = -(tdiv * 14) / 2 if tdiv > 0 else 0.0
             time_source = "fallback_tdiv"
 
-        # --- 6. min/max 包络抽样输出 ---
+        # --- 7. min/max 包络抽样输出 ---
         # 每桶保留最小值与最大值（按真实采样时刻），避免跨步抽样丢失毛刺/峰值。
         returned_points = 0
         with csv_out.open("w", newline="", encoding="utf-8") as f:
@@ -392,7 +398,14 @@ class SDS800XHDTcpAdapter:
                         writer.writerow([start_time + hi * time_interval, voltages[hi]])
                         returned_points += 1
 
-        # --- 7. 元数据 ---
+        # --- 8. 恢复采集状态 ---
+        # 波形读取完成后恢复之前的触发模式，避免 scope 一直停在 STOP。
+        try:
+            self.transport.write(f"TRMD {prev_trmd}")
+        except Exception:  # noqa: BLE001 - 尽力恢复，失败不影响波形数据
+            pass
+
+        # --- 9. 元数据 ---
         wavedesc_info: dict[str, Any] = (
             {
                 "vertical_gain_vdiv": wavedesc.vertical_gain_vdiv,
@@ -416,7 +429,7 @@ class SDS800XHDTcpAdapter:
                 "offset": f"{ch}:OFST?",
                 "timebase": "TDIV?",
                 "sample_rate": "SARA?",
-                "waveform_setup": "WFSU SP,0,NP,0,FP,0",
+                "waveform_setup": "WFSU SP,1,NP,0,FP,0",
                 "waveform_desc": f"{ch}:WF? DESC",
                 "waveform_query": f"{ch}:WF? DAT2",
             },
@@ -499,52 +512,142 @@ def _channel(channel: str) -> Channel:
     return channel  # type: ignore[return-value]
 
 
+def _parse_voltage(value: str) -> float:
+    """Parse voltage value with SI prefixes (case-sensitive: mV≠MV).
+
+    Scope SCPI returns bare scientific notation (1.00E-01), but user-facing
+    inputs and stored metadata may use prefixed forms like "500mV", "1KV".
+    Case-sensitive matching ensures "mV" (milli, 1e-3) is not confused with
+    "MV" (mega, 1e6).
+    """
+    text = value.strip().replace(" ", "")
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    suffixes = [
+        ("GV", 1e9),
+        ("MV", 1e6),   # megavolt — must come before "mV"
+        ("KV", 1e3),
+        ("V", 1.0),
+        ("mV", 1e-3),  # millivolt — case-sensitive, after "MV"
+        ("uV", 1e-6),
+        ("μV", 1e-6),
+        ("nV", 1e-9),
+    ]
+    for suffix, multiplier in sorted(suffixes, key=lambda kv: len(kv[0]), reverse=True):
+        if text.endswith(suffix):
+            number = text[: -len(suffix)]
+            return float(number) * multiplier
+    raise ValueError(f"cannot parse voltage: {value!r}")
+
+
+def _parse_time(value: str) -> float:
+    """Parse time value with SI prefixes.
+
+    Scope convention: "MS" = milliseconds (1e-3), NOT megaseconds.
+    Scope SCPI returns bare scientific notation (5.00E-06 for 5µs),
+    but user inputs like "--coarse-timebase 1MS" arrive prefixed.
+    """
+    text = value.strip().replace(" ", "")
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    suffixes = [
+        ("GS", 1e9),
+        ("MS", 1e-3),  # milliseconds — scope convention, NOT megaseconds
+        ("KS", 1e3),
+        ("S", 1.0),
+        ("US", 1e-6),
+        ("μS", 1e-6),
+        ("NS", 1e-9),
+        ("PS", 1e-12),
+    ]
+    for suffix, multiplier in sorted(suffixes, key=lambda kv: len(kv[0]), reverse=True):
+        if text.endswith(suffix):
+            number = text[: -len(suffix)]
+            return float(number) * multiplier
+    raise ValueError(f"cannot parse time: {value!r}")
+
+
 def _parse_sample_rate(value: str) -> float:
-    return _parse_number_with_units(value.replace("Sa/s", ""))
+    """Parse sample rate value (Sa/s).
+
+    Scope SCPI returns bare scientific notation (2.00E+09 for 2GSa/s),
+    but user-facing display uses prefixed forms like "500MSa/s", "2GSa/s".
+    Strips "Sa/s" suffix then delegates to SI prefix parsing.
+    """
+    text = value.strip().replace(" ", "").replace("Sa/s", "").replace("SA/S", "")
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    suffixes = [
+        ("G", 1e9),
+        ("M", 1e6),
+        ("K", 1e3),
+        ("T", 1e12),
+    ]
+    for suffix, multiplier in sorted(suffixes, key=lambda kv: len(kv[0]), reverse=True):
+        if text.endswith(suffix):
+            number = text[: -len(suffix)]
+            return float(number) * multiplier
+    raise ValueError(f"cannot parse sample rate: {value!r}")
 
 
 def _parse_number_with_units(value: str) -> float:
+    """Legacy generic unit parser — prefer context-specific functions.
+
+    Use _parse_voltage(), _parse_time(), or _parse_sample_rate() for
+    correct handling of ambiguous prefixes (mV vs MV, MS for time vs
+    sample rate). This function remains as a fallback for cases where
+    the unit type is genuinely unknown at parse time.
+    """
     text = value.strip().replace(" ", "")
-    multipliers = {
-        "GV": 1e9,
-        "MV": 1e6,
-        "KV": 1e3,
-        "V": 1.0,
-        "MVOLT": 1e-3,
-        "UV": 1e-6,
-        "GS": 1e9,
-        "MS": 1e6,
-        "KS": 1e3,
-        "S": 1.0,
-        "NS": 1e-9,
-        "US": 1e-6,
-        "MSA": 1e6,
-        "GSA": 1e9,
-        "KSA": 1e3,
-        "M": 1e6,
-        "G": 1e9,
-        "K": 1e3,
-    }
     try:
         return float(text)
     except ValueError:
         pass
 
     upper = text.upper().replace("μ", "U")
-    # Longest suffix first so MS is checked before S.
-    for suffix, multiplier in sorted(multipliers.items(), key=lambda item: len(item[0]), reverse=True):
+    # Generic suffixes sorted longest-first.
+    suffixes = [
+        ("MSA", 1e6),
+        ("GSA", 1e9),
+        ("KSA", 1e3),
+        ("GS", 1e9),
+        ("MS", 1e-3),  # milliseconds (assume time context in generic parser)
+        ("KS", 1e3),
+        ("NS", 1e-9),
+        ("US", 1e-6),
+        ("S", 1.0),
+        ("GV", 1e9),
+        ("MV", 1e6),
+        ("KV", 1e3),
+        ("V", 1.0),
+        # NOTE: "mV" (millivolt) cannot be distinguished from "MV" (megavolt)
+        # after upper() — use _parse_voltage() instead.
+        ("G", 1e9),
+        ("M", 1e6),
+        ("K", 1e3),
+    ]
+    for suffix, multiplier in sorted(suffixes, key=lambda kv: len(kv[0]), reverse=True):
         if upper.endswith(suffix):
             number = upper[: -len(suffix)]
             return float(number) * multiplier
     # Last resort: parse leading numeric part.
-    numeric = []
+    numeric_chars = []
     for char in upper:
         if char.isdigit() or char in ".-+Ee":
-            numeric.append(char)
+            numeric_chars.append(char)
         else:
             break
-    if numeric:
-        return float("".join(numeric))
+    if numeric_chars:
+        return float("".join(numeric_chars))
     raise ValueError(f"cannot parse numeric value: {value!r}")
 
 
