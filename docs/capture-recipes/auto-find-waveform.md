@@ -2,7 +2,7 @@
 
 ## Goal
 
-Automatically find and display a waveform even when the user does not know the signal parameters.
+Automatically find, range, and **leave a waveform visible on the oscilloscope screen** even when the user does not know the signal parameters.
 
 The workflow is intended for field debugging where the engineer may not know:
 
@@ -11,6 +11,7 @@ The workflow is intended for field debugging where the engineer may not know:
 - signal frequency or baudrate
 - trigger level
 - suitable timebase
+- probe attenuation
 
 ## MCP tool
 
@@ -26,12 +27,23 @@ scan C1/C2/C3/C4
   -> export small waveform CSV
   -> compute Vpp / threshold / edge count / edge interval
   -> choose best active channel
-  -> set VDIV and OFST
-  -> set TDIV and edge trigger level
-  -> capture screen image
-  -> export final waveform CSV and metadata
+  -> calculate VDIV / OFST / TDIV
+  -> refine display settings for up to N attempts
+  -> capture a fresh frame and keep scope STOPPED
+  -> capture screen image from the same stopped frame
+  -> analyze final CSV and collect final panel state
   -> write JSON summary
 ```
+
+The default behavior is **screen hold**:
+
+```text
+leave_stopped = true
+screen_hold = true
+```
+
+This means the command should finish with the final waveform still visible on the scope display.
+Use `leave_stopped=false` only when a caller explicitly wants the scope to resume acquisition.
 
 ## Example MCP call
 
@@ -42,7 +54,11 @@ scan C1/C2/C3/C4
   "coarse_timebase": "1MS",
   "initial_vdiv": "1V",
   "max_points": 2000,
-  "noise_floor_v": 0.05
+  "noise_floor_v": 0.05,
+  "probe": 10,
+  "refine_attempts": 3,
+  "leave_stopped": true,
+  "set_trigger_level": false
 }
 ```
 
@@ -52,10 +68,29 @@ scan C1/C2/C3/C4
 python examples/auto_find_waveform_tcp.py <scope-ip> --signal-hint uart
 ```
 
-For RS485/Modbus:
+For direct TTL wiring or a 1X probe:
 
 ```bash
-python examples/auto_find_waveform_tcp.py <scope-ip> --channels C1 C2 --signal-hint modbus --coarse-timebase 1MS
+python examples/auto_find_waveform_tcp.py <scope-ip> \
+  --channels C1 \
+  --signal-hint clock \
+  --probe 1 \
+  --refine-attempts 3
+```
+
+For RS485/Modbus single-ended probing:
+
+```bash
+python examples/auto_find_waveform_tcp.py <scope-ip> \
+  --channels C1 C2 \
+  --signal-hint modbus \
+  --coarse-timebase 1MS
+```
+
+To restart acquisition after capture instead of holding the screen:
+
+```bash
+python examples/auto_find_waveform_tcp.py <scope-ip> --restart-after-capture
 ```
 
 ## Output fields
@@ -64,24 +99,33 @@ python examples/auto_find_waveform_tcp.py <scope-ip> --channels C1 C2 --signal-h
 |---|---|
 | `found` | Whether an active waveform was found |
 | `selected_channel` | Best channel selected by Vpp and edge score |
-| `recommended_vdiv` | Vertical scale chosen for display |
-| `recommended_offset` | Offset chosen to center waveform |
-| `recommended_timebase` | Timebase chosen from edge interval estimate |
-| `trigger_level` | Trigger level near waveform midpoint |
+| `recommended_vdiv` | Final vertical scale chosen for display |
+| `recommended_offset` | Final offset chosen to center waveform |
+| `recommended_timebase` | Final timebase chosen from edge interval estimate |
+| `trigger_level` | Diagnostic trigger level near waveform midpoint |
+| `trigger_level_command_sent` | Whether `C?:TRLV` was actually sent |
+| `leave_stopped` | Whether acquisition was left stopped after capture |
+| `screen_hold` | Whether the tool intentionally holds the final frame on screen |
+| `refine_history` | Per-attempt VDIV/OFST/TDIV and visibility diagnostics |
+| `final_panel_state` | Final channel/acquisition query responses |
 | `screenshot_path` | Captured screen artifact |
 | `final_waveform_csv` | Final waveform CSV after auto setup |
 | `report_json_path` | JSON summary of the auto setup run |
 
+## Trigger-level policy
+
+`set_trigger_level` defaults to `false` because `C?:TRLV <level>` is a known issue on SDS824X HD firmware `4.8.12.1.1.6.5`. AUTO-mode capture is used as the default display-oriented path.
+
 ## Practical limitations
 
-This is a first-pass auto-ranging tool, not a full protocol decoder.
+This is an auto-ranging/display tool, not a full protocol decoder.
 
 It works best when:
 
 - signal is repetitive or present during scan;
 - channel is connected correctly;
 - waveform amplitude is above noise floor;
-- probe attenuation is known or 10X is acceptable;
+- probe attenuation is configured correctly with `--probe`;
 - one of the scanned channels has a clear edge or Vpp.
 
 It may need manual help when:
@@ -98,5 +142,4 @@ It may need manual help when:
 - poll acquisition status instead of using fixed settle delays;
 - add real Auto Setup SCPI command if confirmed in SDS800X HD Programming Guide;
 - add protocol-specific presets for UART, RS485, Modbus, SPI and I2C;
-- add time-aligned RS485 dual-channel auto setup;
-- refresh README after hardware validation.
+- add time-aligned RS485 dual-channel auto setup.
