@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 
+from .auto_setup import auto_find_waveform
 from .modbus_timing import calculate_modbus_rtu_timing
 from .report import ReportInput, generate_markdown_report
 from .rs485_analyzer import analyze_rs485_pair_csv
@@ -207,6 +208,29 @@ def capture_uart_2mbps_tcp(
 
 
 @mcp.tool()
+def auto_find_waveform_tcp(
+    channels: list[Literal["C1", "C2", "C3", "C4"]] | None = None,
+    signal_hint: Literal["unknown", "uart", "rs485", "modbus", "pwm", "clock"] = "unknown",
+    coarse_timebase: str = "1MS",
+    initial_vdiv: str = "1V",
+    max_points: int = 2000,
+    noise_floor_v: float = 0.05,
+) -> dict[str, object]:
+    """Automatically find an active waveform, auto-range display, then capture artifacts."""
+
+    result = auto_find_waveform(
+        _tcp_adapter(),
+        channels=list(channels) if channels else None,
+        signal_hint=signal_hint,
+        coarse_timebase=coarse_timebase,
+        initial_vdiv=initial_vdiv,
+        max_points=max_points,
+        noise_floor_v=noise_floor_v,
+    )
+    return result.to_dict()
+
+
+@mcp.tool()
 def analyze_uart_csv_file(csv_path: str, baudrate: int = 2_000_000) -> dict[str, Any]:
     """Analyze a two-column UART waveform CSV: time_s, voltage_v."""
 
@@ -301,12 +325,13 @@ def project_status() -> dict[str, Any]:
             "screenshot_tcp",
             "get_waveform_tcp",
             "capture_uart_2mbps_tcp",
+            "auto_find_waveform_tcp",
             "analyze_uart_csv_file",
             "analyze_rs485_pair_csv_file",
             "modbus_rtu_timing",
             "generate_report",
         ],
-        "status_note": "经 SDS824X HD 真机验证。WAVEDESC 自适应解码，自动重连，min/max 包络抽样。",
+        "status_note": "经 SDS824X HD 真机验证。WAVEDESC 自适应解码，自动重连，min/max 包络抽样，已加入自动找波形工具。",
     }
 
 
