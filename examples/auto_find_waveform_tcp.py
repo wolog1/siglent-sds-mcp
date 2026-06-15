@@ -22,6 +22,18 @@ def main() -> None:
     parser.add_argument("--initial-vdiv", default="1V")
     parser.add_argument("--max-points", type=int, default=2000)
     parser.add_argument("--noise-floor", type=float, default=0.05)
+    parser.add_argument("--probe", type=float, default=10.0, help="Probe attenuation, e.g. 1 or 10")
+    parser.add_argument("--refine-attempts", type=int, default=3, help="Closed-loop display refinement attempts")
+    parser.add_argument(
+        "--restart-after-capture",
+        action="store_true",
+        help="Restart acquisition after capture. Default leaves scope stopped on final visible frame.",
+    )
+    parser.add_argument(
+        "--set-trigger-level",
+        action="store_true",
+        help="Send C?:TRLV trigger-level command. Disabled by default due SDS824X HD known issue.",
+    )
     args = parser.parse_args()
 
     transport = RawTcpTransport(args.host, args.port, timeout_s=5.0)
@@ -37,6 +49,10 @@ def main() -> None:
             initial_vdiv=args.initial_vdiv,
             max_points=args.max_points,
             noise_floor_v=args.noise_floor,
+            probe=args.probe,
+            refine_attempts=args.refine_attempts,
+            leave_stopped=not args.restart_after_capture,
+            set_trigger_level=args.set_trigger_level,
         )
         print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
     finally:
