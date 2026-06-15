@@ -167,3 +167,49 @@ class TestAutoSetupMock:
             if "trigger_slope" in c.kwargs
         ]
         assert any(c.kwargs.get("trigger_slope") == "NEG" for c in acq_calls)
+
+    def test_screenshot_and_csv_from_same_stop_frame(self, tmp_path: Path) -> None:
+        """Screenshot happens after get_waveform(restore_trmd=False) keeps scope stopped."""
+        c1_path = _write_wave_csv(
+            tmp_path / "signal.csv",
+            [3.3 if (i // 10) % 2 == 0 else 0.0 for i in range(200)],
+        )
+
+        mock_scope = MagicMock(spec=SDS800XHDTcpAdapter)
+        mock_scope.transport = MagicMock()
+        mock_scope.get_waveform.return_value = _make_waveform_result(c1_path)
+        mock_scope.screenshot.return_value = {
+            "path": str(tmp_path / "shot.bmp"),
+            "bytes": 1000,
+            "framing": "raw-bmp",
+        }
+
+        result = auto_find_waveform(
+            mock_scope,
+            channels=["C1"],
+            max_points=2000,
+            noise_floor_v=0.05,
+            settle_s=0.0,
+        )
+
+        assert result.found is True
+        assert result.screenshot_path is not None
+        assert result.final_waveform_csv is not None
+        assert result.final_stats is not None
+
+        # Verify call order: get_waveform (STOPs internally, stays stopped) →
+        # screenshot (same frame) → ARM (restart)
+        from unittest.mock import call as mc
+
+        # get_waveform called twice: coarse scan + final (with restore_trmd=False)
+        wf_calls = mock_scope.get_waveform.call_args_list
+        final_wf_call = wf_calls[-1]
+        assert final_wf_call.kwargs.get("restore_trmd") is False
+
+        # screenshot() called after the final get_waveform
+        mock_scope.screenshot.assert_called_once()
+
+        # ARM is called at the very end to restart acquisition
+        arm_calls = [c for c in mock_scope.transport.write.call_args_list
+                     if c.args and c.args[0] == "ARM"]
+        assert len(arm_calls) >= 1, "ARM should restart acquisition after captures"

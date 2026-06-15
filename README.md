@@ -1,166 +1,161 @@
 # siglent-sds-mcp
 
-MCP server for controlling a SIGLENT SDS824X HD oscilloscope via SCPI.
+MCP server for controlling a SIGLENT SDS824X HD oscilloscope via SCPI over raw TCP.
 
-This repository is being built with a **knowledge-first adaptation workflow**:
-
-1. collect SDS824X HD / SDS800X HD official documents;
-2. build a command compatibility matrix;
-3. compare against the upstream open-source SIGLENT SDS MCP implementation;
-4. verify commands against the SDS800X HD Programming Guide and real SDS824X HD hardware;
-5. expose only verified, safe high-level MCP tools to AI clients.
-
-The first engineering goal is to let an AI tool safely configure the oscilloscope, capture a 2 Mbps UART/RS485 waveform, fetch a screenshot and waveform samples, then return a quantitative signal-quality summary.
-
-## Target device
-
-- SIGLENT SDS824X HD / SDS800X HD family
-- Remote control through SCPI
-- Preferred field transport: LAN raw TCP socket, typically port 5025 after verification
-- Optional fallback: USBTMC / VISA / PyVISA where needed
-- Typical field use: UART, RS485, Modbus, SPI/I2C bring-up and waveform evidence collection
-
-## Reference project
-
-This project intentionally references:
-
-- `MagnusJohansson/siglent-sds-mcp`
-
-The upstream project is valuable because it already implements a SIGLENT SDS MCP server with raw TCP transport, query queue, binary block parsing, screenshot conversion and waveform reconstruction.
-
-Important boundary:
-
-- upstream target/tested model: SDS1104X-E class;
-- this project target: SDS824X HD / SDS800X HD family;
-- therefore, upstream commands are treated as candidates, not final truth.
-
-See:
-
-- [`docs/upstream-reference.md`](docs/upstream-reference.md)
-- [`docs/sds824x-hd-knowledge-base.md`](docs/sds824x-hd-knowledge-base.md)
-- [`docs/sds824x-hd-command-matrix.md`](docs/sds824x-hd-command-matrix.md)
-
-## Architecture
-
-```text
-AI / MCP Client
-   |
-   v
-MCP Server: siglent-sds-mcp
-   |
-   v
-Scope Service Layer
-   |
-   +-- Raw TCP 5025 Transport      preferred for LAN field use
-   |
-   +-- PyVISA / USBTMC Transport   optional fallback
-   |
-   v
-SDS800X HD Command Adapter
-   |
-   v
-SIGLENT SDS824X HD oscilloscope
-```
-
-## MVP tool set
-
-| Tool | Purpose |
-|---|---|
-| `connect` | Connect to oscilloscope over LAN socket or VISA resource. |
-| `identify` | Query `*IDN?` and confirm instrument model/firmware. |
-| `configure_uart_capture` | Configure channel, timebase and edge trigger for UART capture. |
-| `single_capture` | Run single acquisition. |
-| `screenshot` | Capture scope screen after SDS824X HD command verification. |
-| `get_waveform` | Export waveform samples after SDS824X HD command verification. |
-| `analyze_uart_csv_file` | Analyze UART bit width, voltage level and rough signal quality from CSV. |
-
-## Safety model
-
-This project intentionally exposes high-level tools first. Raw SCPI write access is disabled by default because an AI client could otherwise reset the instrument, overwrite settings, or change network configuration.
-
-Default allowed operations:
-
-- identity query
-- run/stop/single acquisition
-- temporary channel/timebase/trigger setup
-- measurement query
-- screenshot/waveform fetch
-- offline waveform analysis
-
-Default blocked operations:
-
-- `*RST`
-- factory reset
-- firmware update
-- network configuration changes
-- file deletion/formatting
-- arbitrary SCPI writes without explicit development mode
+**Project status**: SDS824X HD hardware-tested alpha. Core auto-find-waveform pipeline is functional on real hardware.
 
 ## Quick start
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+# Install
+python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
-```
 
-Run tests:
-
-```bash
+# Test
 pytest -q
+
+# Run MCP server (stdio, for AI client config)
+python -m siglent_sds_mcp.server
+
+# Quick connectivity probe
+python examples/tcp_idn_test.py <scope-ip>
 ```
 
-Run the MCP server over stdio:
+## Auto-find waveform — one-command capture
+
+The headline feature: point at an unknown signal and get a screenshot + waveform CSV with automatic vertical/horizontal/trigger setup.
 
 ```bash
-python -m siglent_sds_mcp.server
+python examples/auto_find_waveform_tcp.py <scope-ip> --channels C1 C2 C3 C4
+
+# With signal-type hint for better timebase selection
+python examples/auto_find_waveform_tcp.py <scope-ip> --signal-hint uart
+
+# Tune capture parameters
+python examples/auto_find_waveform_tcp.py <scope-ip> \
+    --channels C1 C2 \
+    --coarse-timebase 1MS \
+    --initial-vdiv 1V \
+    --max-points 5000 \
+    --noise-floor 0.05
 ```
 
-## First field scenario: 2 Mbps UART
+Output: `found`, `selected_channel`, `recommended_vdiv/offset/timebase`, `screenshot_path`, `final_waveform_csv`, `coarse_stats` vs `final_stats`, JSON report.
 
-For 2 Mbps UART:
+## Architecture
 
-- 1 bit = 500 ns
-- 8N1 byte frame = 10 bits = about 5 us
-- recommended timebase: about 1 us/div
-- recommended sample rate: at least hundreds of MS/s for waveform analysis
-- TTL trigger level: about 1.5 V for 3.3 V UART, 2.5 V for 5 V UART
+```
+MCP client (AI)
+  │ MCP tool calls (stdio)
+  ▼
+server.py — FastMCP tools, auto-reconnect
+  │
+  ▼
+sds_tcp_adapter.py — SDS800X HD command adapter
+  │  channel / acquisition / trigger / measure / screenshot /
+  │  waveform capture (WAVEDESC adaptive decode + envelope decimation)
+  ▼
+tcp_transport.py — RawTcpTransport
+  │  socket-level SCPI, IEEE 488.2 binary block parser,
+  │  thread-safe (RLock), pre-query socket flush
+  ▼
+auto_setup.py — auto_find_waveform
+  │  channel scan → Vpp/edge scoring → VDIV/OFST/TDIV selection →
+  │  screenshot + CSV from same STOP frame → final stats validation
+  ▼
+waveform_stats.py — edge detection, Vpp, threshold, clipping hint
 
-The initial UART tool should produce:
-
-```text
-screenshot.png
-waveform.csv
-analysis.json
+SIGLENT SDS824X HD oscilloscope (LAN port 5025)
 ```
 
-with a summary such as voltage level, estimated bit width, bit timing error, edge count and obvious signal-quality warnings.
+## Command verification pipeline
 
-## Repository layout
+```
+candidate → official-doc → tested → implemented → safe-tool
+```
 
-```text
+Tracked in `docs/sds824x-hd-command-matrix.md`. Do NOT expose an untested command as a default MCP tool.
+
+## Key design decisions
+
+### WAVEDESC adaptive decode
+
+`WF? DAT2` returns 8-bit signed bytes. Voltage decode queries `WF? DESC` first for the WAVEDESC descriptor (little-endian struct with VERTICAL_GAIN, VERTICAL_OFFSET, HORIZ_INTERVAL, HORIZ_OFFSET at known offsets). Cross-validates WAVEDESC gain against `VDIV?` — falls back to `VDIV?/OFST?` if mismatch > 5%.
+
+### Min/max envelope decimation
+
+When `max_points` < raw sample count, each bucket outputs min + max voltages (with correct timestamps) instead of naive stride-sampling. Preserves glitches/spikes stride would miss.
+
+### ARM/STOP behaviour (SDS824X HD verified)
+
+- `STOP` alone: waveform memory readable, but may contain data from previous VDIV settings
+- `ARM` then `STOP`: ARM resets acquisition to "armed, waiting" state — may not trigger in AUTO mode
+- **Correct**: `TRMD AUTO` + wait ≥200ms + `STOP` — ensures waveform reflects current panel settings
+
+### Screenshot/CSV same-frame guarantee
+
+`auto_find_waveform` final capture: `STOP → screenshot → get_waveform(restore_trmd=False) → analyze final stats → ARM`. Screenshot and CSV are always from the same acquisition frame.
+
+## Project structure
+
+```
 src/siglent_sds_mcp/
-  server.py          MCP tools
-  scope_driver.py    SCPI driver scaffold
-  transport.py       PyVISA transport wrapper, to be extended with raw TCP
-  uart_analyzer.py   Offline UART CSV analyzer
+  server.py              — 16+ MCP tools, auto-reconnect, FastMCP
+  sds_tcp_adapter.py     — Command adapter, WAVEDESC decode, envelope, capture
+  tcp_transport.py       — Raw TCP socket, lock, binary block parser
+  auto_setup.py          — auto_find_waveform: scan → score → configure → capture
+  waveform_stats.py      — Edge detection, Vpp, threshold, clipping hint
+  uart_analyzer.py       — Offline UART CSV analyzer
+  rs485_analyzer.py      — RS485 differential pair analyzer
+  modbus_timing.py       — Modbus RTU timing calculator
+  report.py              — Markdown field report generator
+  artifacts.py           — Timestamped artifact paths, JSON writer
+  transport.py           — PyVISA fallback (legacy, not wired into MCP)
+  scope_driver.py        — SiglentSDSDriver with safety gate (legacy)
 
 docs/
-  upstream-reference.md
-  sds824x-hd-knowledge-base.md
-  sds824x-hd-command-matrix.md
+  architecture.md                  — Layered design, UART capture reference
+  sds824x-hd-command-matrix.md     — Per-command verification status
+  sds824x-hd-knowledge-base.md     — Instrument-specific knowledge
+  verification-workflow.md         — Hardware verification procedure
 
-examples/
-  idn_test.py
-  capture_uart_2mbps.py
-
-tests/
-  test_scope_driver_mock.py
-  test_uart_analyzer.py
+tests/   — pytest, socketpair transport tests, mock scope, CSV analysis
+examples/ — auto_find_waveform_tcp, TCP IDN probe, waveform/RS485 capture
 ```
 
-## Project status
+## Safety model
 
-Early scaffold.
+| Allowed | Blocked |
+|---------|---------|
+| `*IDN?`, run/stop/single | `*RST`, factory reset |
+| Channel/timebase/trigger setup | Firmware update |
+| Measurement query | Network config changes |
+| Screenshot/waveform fetch | File deletion/formatting |
+| Offline waveform analysis | Arbitrary SCPI writes |
 
-Important: waveform and screenshot commands must be verified against the SDS800X HD Programming Guide and the actual SDS824X HD firmware revision before production use. The current waveform export method intentionally remains conservative until real command behavior is verified.
+Raw SCPI writes are NOT exposed as MCP tools. `safe_scpi_query_tcp` only accepts `?`-suffixed commands.
+
+## Test coverage
+
+```bash
+pytest -q          # 61 tests
+```
+
+Key test areas:
+- `test_unit_parsing.py` — 24 tests: `_parse_voltage`, `_parse_time`, `_parse_sample_rate` (mV≠MV, MS=milliseconds)
+- `test_wavedesc.py` / `test_wavedesc_parser.py` — synthetic WAVEDESC decode, ASCII prefix handling
+- `test_tcp_binary_prefix.py` — `query_binary` IEEE 488.2 / BMP prefix skipping
+- `test_auto_setup_mock.py` — mock scope channel selection, NEG slope, coarse/final stats
+- `test_waveform_stats.py` — edge detection, active/inactive classification
+- `test_tcp_transport_parser.py` — socketpair binary block parsing
+
+## Target device
+
+- **SIGLENT SDS824X HD** / SDS800X HD family
+- SCPI over raw TCP, port 5025
+- Firmware verified: 4.8.12.1.1.6.5
+
+## Reference
+
+- `MagnusJohansson/siglent-sds-mcp` — upstream SIGLENT SDS MCP reference (SDS1104X-E class)
+- [`docs/upstream-reference.md`](docs/upstream-reference.md)
