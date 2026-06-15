@@ -9,7 +9,9 @@ from siglent_sds_mcp.tcp_transport import RawTcpTransport
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Automatically find and display an unknown waveform")
+    parser = argparse.ArgumentParser(
+        description="Automatically find and display an unknown waveform",
+    )
     parser.add_argument("host", help="Oscilloscope IP address")
     parser.add_argument("--port", type=int, default=5025)
     parser.add_argument("--channels", nargs="+", default=["C1", "C2", "C3", "C4"])
@@ -22,17 +24,27 @@ def main() -> None:
     parser.add_argument("--initial-vdiv", default="1V")
     parser.add_argument("--max-points", type=int, default=2000)
     parser.add_argument("--noise-floor", type=float, default=0.05)
-    parser.add_argument("--probe", type=float, default=10.0, help="Probe attenuation, e.g. 1 or 10")
-    parser.add_argument("--refine-attempts", type=int, default=3, help="Closed-loop display refinement attempts")
+    parser.add_argument(
+        "--probe",
+        type=float,
+        default=10.0,
+        help="Probe attenuation, e.g. 1 or 10",
+    )
+    parser.add_argument(
+        "--refine-attempts",
+        type=int,
+        default=3,
+        help="Closed-loop display refinement attempts",
+    )
     parser.add_argument(
         "--restart-after-capture",
         action="store_true",
-        help="Restart acquisition after capture. Default leaves scope stopped on final visible frame.",
+        help="Restart acquisition after capture; default leaves scope stopped.",
     )
     parser.add_argument(
         "--set-trigger-level",
         action="store_true",
-        help="Send C?:TRLV trigger-level command. Disabled by default due SDS824X HD known issue.",
+        help="Send C?:TRLV trigger-level command; disabled by default.",
     )
     args = parser.parse_args()
 
