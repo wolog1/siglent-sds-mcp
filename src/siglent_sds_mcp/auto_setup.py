@@ -7,13 +7,17 @@ from typing import Literal
 
 from .sds_tcp_adapter import (
     Channel,
-    MeasureParameter,
     SDS800XHDTcpAdapter,
-    _fmt_sci,
-    _parse_meas_value,
-    _pick_tdiv,
-    _pick_vdiv,
 )
+
+
+def _as_float(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 SignalHint = Literal["unknown", "uart", "rs485", "modbus", "pwm", "clock"]
 MIN_PERIODIC_SIGNAL_VPP = 0.005
@@ -66,9 +70,10 @@ def auto_find_waveform(
 ) -> AutoSetupResult:
     """Find, range, and optionally hold an active waveform on screen.
 
-    `noise_floor_v` is treated as the default strong-signal threshold. A smaller
-    periodic waveform can still be accepted when the scope measurement engine
-    reports a valid frequency or period and Vpp is above `min_signal_vpp`.
+    Internally delegates to :meth:`SDS800XHDTcpAdapter.auto_setup` for the
+    robust tdiv-scan + multi-sample measurement pipeline, then applies
+    user-configurable thresholds (``noise_floor_v`` / ``min_signal_vpp``) and
+    post-capture behaviour (``leave_stopped`` / ``set_trigger_level``).
     """
 
     candidate_channels: list[Channel] = channels or ["C1", "C2", "C3", "C4"]
@@ -90,7 +95,11 @@ def auto_find_waveform(
         )
         attempts.append(result)
         if bool(result.get("signal_detected")):
-            result["scan_attempts"] = attempts
+            # Break circular reference: the last entry in attempts *is* result,
+            # so injecting attempts back into result creates a cycle.
+            scan_attempts = list(attempts)
+            scan_attempts[-1] = {k: v for k, v in result.items() if k != "scan_attempts"}
+            result["scan_attempts"] = scan_attempts
             return AutoSetupResult(
                 found=True,
                 selected_channel=channel,
@@ -136,47 +145,41 @@ def _auto_setup_one_channel(
     leave_stopped: bool,
     set_trigger_level: bool,
 ) -> dict[str, object]:
-    steps: list[dict[str, object]] = []
+    """Run the robust ``auto_setup`` pipeline and apply threshold / post-capture rules."""
 
-    scope.configure_channel(
-        channel=channel,
-        vdiv=initial_vdiv,
-        offset="0V",
-        coupling="D1M",
-        trace=True,
-        probe=probe,
+    # Ensure probe attenuation is set before the underlying auto_setup runs.
+    scope.configure_channel(channel, probe=probe)
+    time.sleep(0.05)
+
+    raw = scope.auto_setup(
+        channel,
+        target_cycles=4.0,
+        settle_s=settle_s,
     )
-    scope.configure_acquisition(
-        command="auto",
-        timebase=coarse_timebase,
-        trigger_mode="AUTO",
-        trigger_source=channel,
-        trigger_slope=_trigger_slope(signal_hint),
-    )
-    time.sleep(settle_s)
 
-    coarse = _measure_summary(scope, channel)
-    coarse_pkpk = float(coarse.get("pkpk_v") or 0.0)
-    dc_v = float(coarse.get("mean_v") or 0.0)
-    frequency_hz = _as_float(coarse.get("frequency_hz"))
-    period_s = _as_float(coarse.get("period_s"))
-    if period_s is None and frequency_hz and frequency_hz > 0:
-        period_s = 1.0 / frequency_hz
+    pkpk = float(raw.get("measurements", {}).get("pkpk_v") or 0.0)
+    freq = _as_float(raw.get("measurements", {}).get("frequency_hz"))
+    per = _as_float(raw.get("measurements", {}).get("period_s"))
 
-    periodic_evidence = _has_periodic_evidence(frequency_hz=frequency_hz, period_s=period_s)
+    if not bool(raw.get("signal_detected")):
+        return {
+            "channel": channel,
+            "signal_detected": False,
+            "confidence": "low",
+            "measurements": raw.get("measurements", {}),
+            "periodic_evidence": False,
+            "noise_floor_v": noise_floor_v,
+            "min_signal_vpp": min_signal_vpp,
+            "probe_steps": raw.get("probe_steps", []),
+            "reason": "auto_setup reported no detectable signal",
+        }
+
+    periodic_evidence = _has_periodic_evidence(frequency_hz=freq, period_s=per)
     detection = _classify_signal(
-        pkpk_v=coarse_pkpk,
+        pkpk_v=pkpk,
         noise_floor_v=noise_floor_v,
         min_signal_vpp=min_signal_vpp,
         periodic_evidence=periodic_evidence,
-    )
-    steps.append(
-        {
-            "stage": "coarse",
-            **coarse,
-            "periodic_evidence": periodic_evidence,
-            "detection": detection,
-        }
     )
 
     if not bool(detection["signal_detected"]):
@@ -184,52 +187,36 @@ def _auto_setup_one_channel(
             "channel": channel,
             "signal_detected": False,
             "confidence": "low",
-            "measurements": coarse,
+            "measurements": raw.get("measurements", {}),
             "periodic_evidence": periodic_evidence,
             "noise_floor_v": noise_floor_v,
             "min_signal_vpp": min_signal_vpp,
-            "probe_steps": steps,
+            "probe_steps": raw.get("probe_steps", []),
             "reason": detection["reason"],
         }
 
-    # For low-amplitude periodic signals, use the measured Vpp instead of inflating
-    # display range to noise_floor_v. Example: 22.5mV should choose 5mV/div, not
-    # 10mV/div or larger, so the waveform becomes visible on the screen.
-    final_vdiv = _pick_vdiv(max(coarse_pkpk, min_signal_vpp))
-    final_ofst = _clamp(dc_v, -final_vdiv * 6.0, final_vdiv * 6.0)
-    final_tdiv = _pick_tdiv(period_s or 0.0)
+    # Post-capture behaviour
+    if leave_stopped:
+        scope.transport.write("STOP")
+        time.sleep(0.05)
+    else:
+        scope.transport.write("ARM")
+        time.sleep(0.05)
 
-    vmax = _as_float(coarse.get("max_v"))
-    vmin = _as_float(coarse.get("min_v"))
-    trig_level = (vmax + vmin) / 2.0 if vmax is not None and vmin is not None else dc_v
+    # If the caller does not want us to touch trigger level, override the
+    # level set by the underlying auto_setup with a no-op (None).
+    if not set_trigger_level:
+        scope.configure_acquisition(
+            command="run" if not leave_stopped else "auto",
+            trigger_mode="AUTO",
+            trigger_source=channel,
+            trigger_level=None,
+            trigger_slope=_trigger_slope(signal_hint),
+        )
+        time.sleep(0.1)
 
-    scope.configure_channel(
-        channel=channel,
-        vdiv=_fmt_sci(final_vdiv),
-        offset=_fmt_sci(final_ofst),
-        coupling="D1M",
-        trace=True,
-        probe=probe,
-    )
-    scope.configure_acquisition(
-        command="auto",
-        timebase=_fmt_sci(final_tdiv),
-        trigger_mode="AUTO",
-        trigger_source=channel,
-        trigger_level=_fmt_sci(trig_level) if set_trigger_level else None,
-        trigger_slope=_trigger_slope(signal_hint),
-    )
-    time.sleep(settle_s)
-
-    # Product goal: leave waveform visible. Use AUTO to acquire a fresh frame,
-    # then STOP and do not ARM again unless explicitly requested.
-    scope.transport.write("STOP")
-    time.sleep(0.05)
     final_status = scope.get_acquisition_status()
     final_channel = scope.get_channel(channel)
-
-    if not leave_stopped:
-        scope.transport.write("ARM")
 
     return {
         "channel": channel,
@@ -243,46 +230,15 @@ def _auto_setup_one_channel(
         "noise_floor_v": noise_floor_v,
         "min_signal_vpp": min_signal_vpp,
         "periodic_evidence": periodic_evidence,
-        "final_settings": {
-            "vdiv_v": final_vdiv,
-            "offset_v": final_ofst,
-            "tdiv_s": final_tdiv,
-            "trigger_level_v": trig_level,
-            "trigger_slope": _trigger_slope(signal_hint),
-        },
-        "measurements": {
-            **coarse,
-            "period_s": period_s,
-        },
+        "final_settings": raw.get("final_settings", {}),
+        "measurements": raw.get("measurements", {}),
         "final_panel_state": {
             "channel": final_channel,
             "acquisition": final_status,
         },
-        "probe_steps": steps,
+        "probe_steps": raw.get("probe_steps", []),
+        "screenshot": raw.get("screenshot"),
     }
-
-
-def _measure_summary(scope: SDS800XHDTcpAdapter, channel: Channel) -> dict[str, float | None]:
-    values = {
-        "pkpk_v": _measure(scope, channel, "PKPK"),
-        "mean_v": _measure(scope, channel, "MEAN"),
-        "max_v": _measure(scope, channel, "MAX"),
-        "min_v": _measure(scope, channel, "MIN"),
-        "frequency_hz": _measure(scope, channel, "FREQ"),
-        "period_s": _measure(scope, channel, "PER"),
-    }
-    return values
-
-
-def _measure(
-    scope: SDS800XHDTcpAdapter,
-    channel: Channel,
-    parameter: MeasureParameter,
-) -> float | None:
-    try:
-        return _parse_meas_value(scope.measure(channel, parameter)["value"])
-    except Exception:  # noqa: BLE001 - measurement probing should degrade gracefully
-        return None
 
 
 def _classify_signal(
@@ -319,16 +275,3 @@ def _has_periodic_evidence(frequency_hz: float | None, period_s: float | None) -
 
 def _trigger_slope(signal_hint: SignalHint) -> Literal["POS", "NEG"]:
     return "NEG" if signal_hint in {"uart", "rs485", "modbus"} else "POS"
-
-
-def _as_float(value: object) -> float | None:
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _clamp(value: float, lower: float, upper: float) -> float:
-    return max(lower, min(upper, value))
