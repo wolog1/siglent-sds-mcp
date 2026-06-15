@@ -81,12 +81,18 @@ class AutoSetupResult:
     probes: list[ChannelProbe] = field(default_factory=list)
     coarse_stats: dict[str, object] | None = None
     final_stats: dict[str, object] | None = None
+    final_panel_state: dict[str, object] | None = None
+    refine_history: list[dict[str, object]] = field(default_factory=list)
     final_waveform_csv: str | None = None
     final_metadata_path: str | None = None
     screenshot_path: str | None = None
     report_json_path: str | None = None
     notes: list[str] = field(default_factory=list)
-    offset_direction_status: str = "verified_on_sds824xhd: voltage=code*gain+offset"
+    offset_direction_status: str = "verified_on_sds824xhd: display_offset_uses_waveform_mean"
+    leave_stopped: bool = True
+    screen_hold: bool = True
+    trigger_level_command_sent: bool = False
+    probe: float = 10.0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -101,12 +107,18 @@ class AutoSetupResult:
             "probes": [asdict(probe) for probe in self.probes],
             "coarse_stats": self.coarse_stats,
             "final_stats": self.final_stats,
+            "final_panel_state": self.final_panel_state,
+            "refine_history": self.refine_history,
             "final_waveform_csv": self.final_waveform_csv,
             "final_metadata_path": self.final_metadata_path,
             "screenshot_path": self.screenshot_path,
             "report_json_path": self.report_json_path,
             "notes": self.notes,
             "offset_direction_status": self.offset_direction_status,
+            "leave_stopped": self.leave_stopped,
+            "screen_hold": self.screen_hold,
+            "trigger_level_command_sent": self.trigger_level_command_sent,
+            "probe": self.probe,
         }
 
 
@@ -119,12 +131,23 @@ def auto_find_waveform(
     max_points: int = 2000,
     noise_floor_v: float = 0.05,
     settle_s: float = 0.15,
+    probe: float = 10.0,
+    refine_attempts: int = 3,
+    leave_stopped: bool = True,
+    set_trigger_level: bool = False,
 ) -> AutoSetupResult:
-    """Find and auto-range an unknown waveform using existing SDS TCP adapter tools."""
+    """Find, auto-range and leave an unknown waveform visible on the scope screen.
+
+    Product goal: after the tool returns, the oscilloscope should hold the final
+    stopped acquisition frame by default. Use leave_stopped=False only when the
+    caller explicitly wants the scope to resume acquisition after artifacts are
+    captured.
+    """
 
     candidate_channels: list[Channel] = channels or ["C1", "C2", "C3", "C4"]
     probes: list[ChannelProbe] = []
     notes: list[str] = []
+    trigger_level_command_sent = False
 
     scope.configure_acquisition(trigger_mode="AUTO", timebase=coarse_timebase, command="auto")
 
@@ -136,7 +159,7 @@ def auto_find_waveform(
                 offset="0V",
                 coupling="D1M",
                 trace=True,
-                probe=10,
+                probe=probe,
             )
             time.sleep(settle_s)
             wf = scope.get_waveform(channel=channel, max_points=max_points)
@@ -163,7 +186,7 @@ def auto_find_waveform(
                 )
             )
 
-    valid = [probe for probe in probes if probe.stats is not None and probe.score >= 0.0]
+    valid = [item for item in probes if item.stats is not None and item.score >= 0.0]
     if not valid:
         result = AutoSetupResult(
             found=False,
@@ -176,6 +199,10 @@ def auto_find_waveform(
             trigger_level=None,
             probes=probes,
             notes=["No channel could be probed successfully."],
+            leave_stopped=leave_stopped,
+            screen_hold=False,
+            trigger_level_command_sent=False,
+            probe=probe,
         )
         return _write_auto_result(result)
 
@@ -199,84 +226,169 @@ def auto_find_waveform(
             trigger_level=None,
             probes=probes,
             notes=["No obvious active waveform found above noise floor."],
+            leave_stopped=leave_stopped,
+            screen_hold=False,
+            trigger_level_command_sent=False,
+            probe=probe,
         )
         return _write_auto_result(result)
 
-    recommended_vdiv = choose_vdiv(vpp)
-    recommended_offset = _format_volts(vmean or 0.0)
-    recommended_timebase = choose_timebase(edge_interval, signal_hint=signal_hint)
+    current_vdiv = choose_vdiv(vpp)
+    current_offset = _format_volts(vmean or 0.0)
+    current_timebase = choose_timebase(edge_interval, signal_hint=signal_hint)
     trigger_level = _format_volts(threshold if threshold is not None else (vmean or 0.0))
     confidence = _confidence(vpp=vpp, edge_count=edge_count, noise_floor_v=noise_floor_v)
     coarse_stats = best.stats
+    refine_history: list[dict[str, object]] = []
 
     notes.append(f"Selected {best.channel}: Vpp={vpp:.6g} V, edges={edge_count}.")
-    notes.append(f"Vertical setup: VDIV={recommended_vdiv}, OFST={recommended_offset}.")
-    if recommended_timebase:
-        notes.append(f"Timebase setup: TDIV={recommended_timebase}.")
-    notes.append(f"Trigger level set near waveform midpoint: {trigger_level}.")
+    notes.append(f"Initial vertical setup: VDIV={current_vdiv}, OFST={current_offset}.")
+    notes.append(f"Initial timebase setup: TDIV={current_timebase}.")
     notes.append(
-        "offset_direction_status=needs_hardware_validation: "
-        "OFST=vmean assumes voltage = code*gain - offset; verify with 3.3V square wave."
+        "Trigger level is calculated for diagnostics, but not sent by default because "
+        "C?:TRLV is a known issue on SDS824X HD firmware 4.8.12.1.1.6.5."
     )
 
-    scope.configure_channel(
-        channel=best.channel,
-        vdiv=recommended_vdiv,
-        offset=recommended_offset,
-        coupling="D1M",
-        trace=True,
-        probe=10,
-    )
-    scope.configure_acquisition(
-        timebase=recommended_timebase,
-        trigger_mode="AUTO",
-        trigger_source=best.channel,
-        trigger_level=trigger_level,
-        trigger_slope="NEG" if signal_hint in {"uart", "rs485", "modbus"} else "POS",
-        command="auto",
-    )
-    time.sleep(settle_s)
+    final_wf = None
+    final_stats: dict[str, object] | None = None
+    final_vdiv = current_vdiv
+    final_offset = current_offset
+    final_timebase = current_timebase
+    attempts = max(1, refine_attempts)
 
-    # Same-frame evidence package:
-    # get_waveform(..., restore_trmd=False) internally lets AUTO acquire a fresh frame,
-    # then STOPs and leaves the instrument stopped. The following screenshot is taken
-    # from that same stopped frame.
-    final_wf = scope.get_waveform(channel=best.channel, max_points=max_points, restore_trmd=False)
+    for attempt in range(1, attempts + 1):
+        scope.configure_channel(
+            channel=best.channel,
+            vdiv=current_vdiv,
+            offset=current_offset,
+            coupling="D1M",
+            trace=True,
+            probe=probe,
+        )
+        scope.configure_acquisition(
+            timebase=current_timebase,
+            trigger_mode="AUTO",
+            trigger_source=best.channel,
+            trigger_level=trigger_level if set_trigger_level else None,
+            trigger_slope="NEG" if signal_hint in {"uart", "rs485", "modbus"} else "POS",
+            command="auto",
+        )
+        trigger_level_command_sent = trigger_level_command_sent or set_trigger_level
+        time.sleep(settle_s)
+
+        # Capture a fresh frame and leave it stopped. This makes the screen itself
+        # the primary output, not just the returned CSV.
+        final_wf = scope.get_waveform(channel=best.channel, max_points=max_points, restore_trmd=False)
+        final_stats_raw = analyze_waveform_csv(final_wf.csv_path, noise_floor_v=noise_floor_v)
+        final_stats = final_stats_raw.to_dict()
+
+        final_vpp = _float_or_none(final_stats.get("v_pp"))
+        final_mean = _float_or_none(final_stats.get("v_mean"))
+        final_edge_interval = _float_or_none(final_stats.get("median_edge_interval_s"))
+        current_vdiv_value = _vdiv_label_to_value(current_vdiv)
+        vertical_divisions = final_vpp / current_vdiv_value if final_vpp and current_vdiv_value else None
+        visible_hint = bool(final_vpp and final_vpp >= noise_floor_v and vertical_divisions and 1.0 <= vertical_divisions <= 7.5)
+
+        refine_history.append(
+            {
+                "attempt": attempt,
+                "vdiv": current_vdiv,
+                "offset": current_offset,
+                "timebase": current_timebase,
+                "vpp": final_vpp,
+                "vertical_divisions": vertical_divisions,
+                "edge_count": final_stats.get("edge_count"),
+                "visible_hint": visible_hint,
+            }
+        )
+
+        final_vdiv = current_vdiv
+        final_offset = current_offset
+        final_timebase = current_timebase
+        if visible_hint and final_stats.get("edge_count", 0) is not None:
+            notes.append(
+                f"Refine attempt {attempt}: waveform visible, "
+                f"Vpp={final_vpp:.6g} V, vertical_divisions={vertical_divisions:.3g}."
+            )
+            break
+
+        if final_vpp and final_vpp >= noise_floor_v:
+            current_vdiv = choose_vdiv(final_vpp)
+        if final_mean is not None:
+            current_offset = _format_volts(final_mean)
+        current_timebase = choose_timebase(final_edge_interval, signal_hint=signal_hint)
+        notes.append(
+            f"Refine attempt {attempt}: adjusted to VDIV={current_vdiv}, "
+            f"OFST={current_offset}, TDIV={current_timebase}."
+        )
+
+    if final_wf is None or final_stats is None:
+        result = AutoSetupResult(
+            found=False,
+            selected_channel=best.channel,
+            signal_hint=signal_hint,
+            confidence="low",
+            recommended_vdiv=final_vdiv,
+            recommended_offset=final_offset,
+            recommended_timebase=final_timebase,
+            trigger_level=trigger_level,
+            probes=probes,
+            coarse_stats=coarse_stats,
+            refine_history=refine_history,
+            notes=notes + ["Final waveform capture did not complete."],
+            leave_stopped=leave_stopped,
+            screen_hold=False,
+            trigger_level_command_sent=trigger_level_command_sent,
+            probe=probe,
+        )
+        return _write_auto_result(result)
+
     shot = scope.screenshot(default_artifact_paths("auto_find_waveform")["screenshot_raw"])
-    final_stats_raw = analyze_waveform_csv(final_wf.csv_path, noise_floor_v=noise_floor_v)
-    final_stats = final_stats_raw.to_dict()
-
+    final_panel_state = _collect_final_panel_state(scope, best.channel)
     final_vpp = _float_or_none(final_stats.get("v_pp"))
+    screen_hold = leave_stopped
+
     if final_vpp and final_vpp >= noise_floor_v:
         notes.append(
             f"Final waveform: Vpp={final_vpp:.6g} V, edges={final_stats.get('edge_count')}, "
-            "visible after auto-setup."
+            "captured on stopped frame."
         )
     else:
         notes.append("Warning: final waveform still near noise floor after auto-setup.")
 
-    try:
-        scope.transport.write("ARM")
-    except Exception as exc:  # noqa: BLE001 - capture already succeeded; keep diagnostic note
-        notes.append(f"Warning: failed to restart acquisition after capture: {exc!r}")
+    if leave_stopped:
+        notes.append("Screen hold enabled: leaving scope stopped on the final visible frame.")
+    else:
+        try:
+            scope.transport.write("ARM")
+            screen_hold = False
+            notes.append("Restarted acquisition after capture because leave_stopped=False.")
+        except Exception as exc:  # noqa: BLE001 - capture already succeeded; keep diagnostic note
+            notes.append(f"Warning: failed to restart acquisition after capture: {exc!r}")
 
     result = AutoSetupResult(
         found=True,
         selected_channel=best.channel,
         signal_hint=signal_hint,
         confidence=confidence,
-        recommended_vdiv=recommended_vdiv,
-        recommended_offset=recommended_offset,
-        recommended_timebase=recommended_timebase,
+        recommended_vdiv=final_vdiv,
+        recommended_offset=final_offset,
+        recommended_timebase=final_timebase,
         trigger_level=trigger_level,
         probes=probes,
         coarse_stats=coarse_stats,
         final_stats=final_stats,
+        final_panel_state=final_panel_state,
+        refine_history=refine_history,
         final_waveform_csv=final_wf.csv_path,
         final_metadata_path=final_wf.metadata_path,
         screenshot_path=str(shot.get("path")) if shot.get("path") else None,
         notes=notes,
-        offset_direction_status="needs_hardware_validation",
+        offset_direction_status="verified_on_sds824xhd: display_offset_uses_waveform_mean",
+        leave_stopped=leave_stopped,
+        screen_hold=screen_hold,
+        trigger_level_command_sent=trigger_level_command_sent,
+        probe=probe,
     )
     return _write_auto_result(result)
 
@@ -341,6 +453,44 @@ def _format_volts(value: float) -> str:
     if abs(value) < 1e-9:
         return "0V"
     return f"{value:.6g}V"
+
+
+def _vdiv_label_to_value(label: str) -> float | None:
+    for value, item_label in _VDIV_STEPS:
+        if item_label == label:
+            return value
+    return None
+
+
+def _collect_final_panel_state(scope: SDS800XHDTcpAdapter, channel: Channel) -> dict[str, object]:
+    panel: dict[str, object] = {"channel": channel}
+    try:
+        channel_state = scope.get_channel(channel)
+        panel["channel_state"] = _jsonable_dict(channel_state)
+    except Exception as exc:  # noqa: BLE001
+        panel["channel_state_error"] = repr(exc)
+    try:
+        acquisition_state = scope.get_acquisition_status()
+        panel["acquisition_state"] = _jsonable_dict(acquisition_state)
+    except Exception as exc:  # noqa: BLE001
+        panel["acquisition_state_error"] = repr(exc)
+    return panel
+
+
+def _jsonable_dict(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {"value": repr(value)}
+    result: dict[str, object] = {}
+    for key, item in value.items():
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            result[str(key)] = item
+        elif isinstance(item, list):
+            result[str(key)] = [x if isinstance(x, (str, int, float, bool)) or x is None else repr(x) for x in item]
+        elif isinstance(item, dict):
+            result[str(key)] = _jsonable_dict(item)
+        else:
+            result[str(key)] = repr(item)
+    return result
 
 
 def _write_auto_result(result: AutoSetupResult) -> AutoSetupResult:
