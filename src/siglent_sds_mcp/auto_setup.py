@@ -120,14 +120,7 @@ def auto_find_waveform(
     noise_floor_v: float = 0.05,
     settle_s: float = 0.15,
 ) -> AutoSetupResult:
-    """Find and auto-range an unknown waveform using existing SDS TCP adapter tools.
-
-    The first version is intentionally conservative:
-    - scan enabled candidate channels with broad settings;
-    - choose the most active channel by Vpp and edge count;
-    - adjust vertical scale, offset, timebase and edge trigger;
-    - save a screen image and final waveform artifacts.
-    """
+    """Find and auto-range an unknown waveform using existing SDS TCP adapter tools."""
 
     candidate_channels: list[Channel] = channels or ["C1", "C2", "C3", "C4"]
     probes: list[ChannelProbe] = []
@@ -223,10 +216,9 @@ def auto_find_waveform(
     notes.append(f"Trigger level set near waveform midpoint: {trigger_level}.")
     notes.append(
         "offset_direction_status=needs_hardware_validation: "
-        "OFST=vmean assumes voltage = code*gain - offset; verify with 3.3V square wave on real scope."
+        "OFST=vmean assumes voltage = code*gain - offset; verify with 3.3V square wave."
     )
 
-    # --- Apply final setup ---
     scope.configure_channel(
         channel=best.channel,
         vdiv=recommended_vdiv,
@@ -245,31 +237,28 @@ def auto_find_waveform(
     )
     time.sleep(settle_s)
 
-    # --- Final capture: screenshot + waveform from the SAME STOP frame ---
-    # Sequence matters: STOP first, then screenshot, then waveform (without
-    # restoring TRMD in between), so the screenshot and CSV represent the
-    # exact same acquisition frame.  Only restore TRMD after both are saved.
-    scope.transport.write("STOP")
-    time.sleep(0.1)
-
-    shot = scope.screenshot(default_artifact_paths("auto_find_waveform")["screenshot_raw"])
-
+    # Same-frame evidence package:
+    # get_waveform(..., restore_trmd=False) internally lets AUTO acquire a fresh frame,
+    # then STOPs and leaves the instrument stopped. The following screenshot is taken
+    # from that same stopped frame.
     final_wf = scope.get_waveform(channel=best.channel, max_points=max_points, restore_trmd=False)
+    shot = scope.screenshot(default_artifact_paths("auto_find_waveform")["screenshot_raw"])
     final_stats_raw = analyze_waveform_csv(final_wf.csv_path, noise_floor_v=noise_floor_v)
     final_stats = final_stats_raw.to_dict()
 
-    # Verify the final waveform actually improved visibility.
     final_vpp = _float_or_none(final_stats.get("v_pp"))
     if final_vpp and final_vpp >= noise_floor_v:
         notes.append(
             f"Final waveform: Vpp={final_vpp:.6g} V, edges={final_stats.get('edge_count')}, "
-            f"visible after auto-setup."
+            "visible after auto-setup."
         )
     else:
         notes.append("Warning: final waveform still near noise floor after auto-setup.")
 
-    # Restore acquisition after all captures are done.
-    scope.transport.write("ARM")
+    try:
+        scope.transport.write("ARM")
+    except Exception as exc:  # noqa: BLE001 - capture already succeeded; keep diagnostic note
+        notes.append(f"Warning: failed to restart acquisition after capture: {exc!r}")
 
     result = AutoSetupResult(
         found=True,
@@ -356,6 +345,6 @@ def _format_volts(value: float) -> str:
 
 def _write_auto_result(result: AutoSetupResult) -> AutoSetupResult:
     path = ensure_parent(default_artifact_paths("auto_find_waveform")["analysis_json"])
-    write_json(path, result.to_dict())
     result.report_json_path = str(path)
+    write_json(path, result.to_dict())
     return result
