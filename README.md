@@ -2,7 +2,7 @@
 
 MCP server for controlling a SIGLENT SDS824X HD oscilloscope via SCPI over raw TCP.
 
-**Project status**: SDS824X HD hardware-tested alpha. Core auto-find-waveform pipeline is functional on real hardware.
+**Project status**: SDS824X HD hardware-tested alpha. Core measurement-driven auto setup is functional on real hardware.
 
 ## Quick start
 
@@ -21,28 +21,28 @@ python -m siglent_sds_mcp.server
 python examples/tcp_idn_test.py <scope-ip>
 ```
 
-## Auto-find waveform — one-command screen setup
+## Auto setup — one-command screen setup
 
-The headline feature: point at an unknown signal and leave the detected waveform visible on the scope screen, with screenshot + waveform CSV artifacts.
+The main feature: point at an unknown signal and let the scope measurement engine find usable VDIV / OFST / TDIV settings.
 
 ```bash
+# Backwards-compatible CLI name; internally uses measurement-driven auto setup
 python examples/auto_find_waveform_tcp.py <scope-ip> --channels C1 C2 C3 C4
 
-# With signal-type hint for better timebase selection
+# With signal-type hint for better trigger slope policy
 python examples/auto_find_waveform_tcp.py <scope-ip> --signal-hint uart
 
 # Direct TTL wiring / 1X probe
 python examples/auto_find_waveform_tcp.py <scope-ip> \
     --channels C1 \
     --signal-hint clock \
-    --probe 1 \
-    --refine-attempts 3
+    --probe 1
 
 # Restart acquisition after capture only when explicitly requested
 python examples/auto_find_waveform_tcp.py <scope-ip> --restart-after-capture
 ```
 
-Default behavior: `leave_stopped=true`. The tool intentionally leaves the scope stopped on the final visible frame. Output includes `screen_hold`, `refine_history`, `final_panel_state`, `screenshot_path`, `final_waveform_csv`, `coarse_stats`, and `final_stats`.
+Default behavior: `leave_stopped=true`. The tool intentionally leaves the scope stopped on the final visible frame. The return object includes `screen_hold`, `final_panel_state`, `measurements`, `final_settings`, and `probe_steps`.
 
 ## Architecture
 
@@ -55,17 +55,14 @@ server.py — FastMCP tools, auto-reconnect
   ▼
 sds_tcp_adapter.py — SDS800X HD command adapter
   │  channel / acquisition / trigger / measure / screenshot /
-  │  waveform capture (WAVEDESC adaptive decode + envelope decimation)
+  │  waveform capture (WAVEDESC adaptive decode + envelope decimation) /
+  │  measurement-driven auto_setup
   ▼
 tcp_transport.py — RawTcpTransport
   │  socket-level SCPI, IEEE 488.2 binary block parser,
   │  thread-safe (RLock), pre-query socket flush
   ▼
-auto_setup.py — auto_find_waveform
-  │  channel scan → Vpp/edge scoring → VDIV/OFST/TDIV refinement →
-  │  final stopped-frame screenshot + CSV → panel-state validation
-  ▼
-waveform_stats.py — edge detection, Vpp, threshold, clipping hint
+auto_setup.py — compatibility wrapper for historical auto_find_waveform API
 
 SIGLENT SDS824X HD oscilloscope (LAN port 5025)
 ```
@@ -80,37 +77,34 @@ Tracked in `docs/sds824x-hd-command-matrix.md`. Do NOT expose an untested comman
 
 ## Key design decisions
 
+### Measurement-driven auto setup
+
+`SDS800XHDTcpAdapter.auto_setup()` uses scope measurements (`PKPK`, `MEAN`, `FREQ`, `PER`, `MAX`, `MIN`) to select display settings. This avoids relying on a separate offline CSV analyzer for first-pass screen setup.
+
 ### WAVEDESC adaptive decode
 
-`WF? DAT2` returns 8-bit signed bytes. Voltage decode queries `WF? DESC` first for the WAVEDESC descriptor (little-endian struct with VERTICAL_GAIN, VERTICAL_OFFSET, HORIZ_INTERVAL, HORIZ_OFFSET at known offsets). Cross-validates WAVEDESC gain against `VDIV?` — falls back to `VDIV?/OFST?` if mismatch > 5%.
+`WF? DAT2` returns 8-bit signed bytes. Voltage decode queries `WF? DESC` for the WAVEDESC descriptor and uses the descriptor-derived `codes_per_div` with current panel `VDIV? / OFST?` for decoding.
 
 ### Min/max envelope decimation
 
-When `max_points` < raw sample count, each bucket outputs min + max voltages (with correct timestamps) instead of naive stride-sampling. Preserves glitches/spikes stride would miss.
+When `max_points` < raw sample count, each bucket outputs min + max voltages instead of naive stride-sampling. Preserves glitches/spikes stride would miss.
 
-### ARM/STOP behaviour (SDS824X HD verified)
+### ARM/STOP behaviour
 
-- `STOP` alone: waveform memory readable, but may contain data from previous VDIV settings
-- `ARM` then `STOP`: ARM resets acquisition to "armed, waiting" state — may not trigger in AUTO mode
-- **Correct**: `TRMD AUTO` + wait ≥200ms + `STOP` — ensures waveform reflects current panel settings
-
-### Screenshot/CSV same-frame and screen-hold guarantee
-
-`auto_find_waveform` final capture uses `get_waveform(restore_trmd=False)`. That function switches to `TRMD AUTO`, waits for a fresh acquisition, sends `STOP`, exports the CSV, and intentionally leaves the scope stopped. `auto_find_waveform` then calls `screenshot()` and collects final panel state. It does **not** restart acquisition unless `leave_stopped=false` / `--restart-after-capture` is explicitly requested.
+`get_waveform()` must ensure waveform memory reflects the current panel settings before `WF? DAT2`. This path is still hardware-sensitive; keep validation notes in `docs/sds824x-hd-command-matrix.md` up to date when changing ARM/SINGLE/AUTO behaviour.
 
 ### Trigger level policy
 
-`C?:TRLV <level>` is not sent by default because it is a known issue on SDS824X HD firmware `4.8.12.1.1.6.5`. AUTO-mode capture is the default display-oriented path. Use `set_trigger_level=true` only for trigger-command investigation.
+`C?:TRLV <level>` is a known issue on SDS824X HD firmware `4.8.12.1.1.6.5`. Display-oriented auto setup should not depend on this command by default.
 
 ## Project structure
 
 ```
 src/siglent_sds_mcp/
   server.py              — MCP tools, auto-reconnect, FastMCP
-  sds_tcp_adapter.py     — Command adapter, WAVEDESC decode, envelope, capture
+  sds_tcp_adapter.py     — Command adapter, WAVEDESC decode, envelope, auto_setup
   tcp_transport.py       — Raw TCP socket, lock, binary block parser
-  auto_setup.py          — auto_find_waveform: scan → score → refine → hold screen
-  waveform_stats.py      — Edge detection, Vpp, threshold, clipping hint
+  auto_setup.py          — Compatibility wrapper for auto_find_waveform API
   uart_analyzer.py       — Offline UART CSV analyzer
   rs485_analyzer.py      — RS485 differential pair analyzer
   modbus_timing.py       — Modbus RTU timing calculator
@@ -125,7 +119,7 @@ docs/
   sds824x-hd-knowledge-base.md     — Instrument-specific knowledge
   verification-workflow.md         — Hardware verification procedure
 
-tests/   — pytest, socketpair transport tests, mock scope, CSV analysis
+tests/   — pytest, parser tests, TCP transport tests, auto setup helper tests
 examples/ — auto_find_waveform_tcp, TCP IDN probe, waveform/RS485 capture
 ```
 
@@ -151,8 +145,7 @@ Key test areas:
 - `test_unit_parsing.py` — `_parse_voltage`, `_parse_time`, `_parse_sample_rate`
 - `test_wavedesc.py` / `test_wavedesc_parser.py` — synthetic WAVEDESC decode, ASCII prefix handling
 - `test_tcp_binary_prefix.py` — `query_binary` IEEE 488.2 / BMP prefix skipping
-- `test_auto_setup_mock.py` — channel selection, no default ARM, trigger policy, probe, stats
-- `test_waveform_stats.py` — edge detection, active/inactive classification
+- `test_auto_setup.py` — `_pick_vdiv`, `_pick_tdiv`, measurement parser and SCPI number formatting
 - `test_tcp_transport_parser.py` — socketpair binary block parsing
 
 ## Target device
