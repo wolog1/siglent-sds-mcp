@@ -25,6 +25,12 @@ def main() -> None:
     parser.add_argument("--max-points", type=int, default=2000)
     parser.add_argument("--noise-floor", type=float, default=0.05)
     parser.add_argument(
+        "--min-signal-vpp",
+        type=float,
+        default=0.005,
+        help="Minimum Vpp accepted when a valid frequency/period is measured.",
+    )
+    parser.add_argument(
         "--probe",
         type=float,
         default=10.0,
@@ -61,6 +67,7 @@ def main() -> None:
             initial_vdiv=args.initial_vdiv,
             max_points=args.max_points,
             noise_floor_v=args.noise_floor,
+            min_signal_vpp=args.min_signal_vpp,
             probe=args.probe,
             refine_attempts=args.refine_attempts,
             leave_stopped=not args.restart_after_capture,
