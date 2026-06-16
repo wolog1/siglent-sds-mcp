@@ -295,7 +295,7 @@ class SDS800XHDTcpAdapter:
         target_cycles: float = 4.0,
         settle_s: float = 0.6,
         screenshot_path: str | Path | None = None,
-        set_trigger_level: bool = True,
+        set_trigger_level: bool = False,
     ) -> dict[str, Any]:
         """自动探测信号并把波形调整到屏幕最佳显示（类似面板 Auto Setup）。
 
@@ -348,10 +348,15 @@ class SDS800XHDTcpAdapter:
         # --- Step 1: 宽量程粗测 DC 与 PKPK（多次采样取最大，应对间歇信号）---
         self.configure_channel(ch, vdiv="1V", offset="0V", coupling="D1M", trace=True)
         self.transport.write("TRDL 0S")
-        self.configure_acquisition(
-            command="run", trigger_mode="AUTO",
-            trigger_source=ch, trigger_level="0.0000E+00", trigger_slope="POS",
-        )
+        coarse_acq: dict[str, Any] = {
+            "command": "run",
+            "trigger_mode": "AUTO",
+            "trigger_source": ch,
+            "trigger_slope": "POS",
+        }
+        if set_trigger_level:
+            coarse_acq["trigger_level"] = "0.0000E+00"
+        self.configure_acquisition(**coarse_acq)
         _wait_trigger(timeout=settle_s)
         # 多次采样取最大 PKPK（间歇信号可能在某次刚好出现）
         pkpk_samples = _poll_meas("PKPK", n=5, interval=0.15)
