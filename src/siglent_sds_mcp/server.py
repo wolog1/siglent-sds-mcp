@@ -12,6 +12,7 @@ from .rs485_analyzer import analyze_rs485_pair_csv
 from .sds_tcp_adapter import SDS800XHDTcpAdapter
 from .tcp_transport import RawTcpTransport
 from .uart_analyzer import analyze_uart_csv
+from .waveform_capture import get_waveform_with_mode
 
 mcp = FastMCP("siglent-sds-mcp", json_response=True)
 
@@ -246,14 +247,24 @@ def get_waveform_tcp(
     csv_path: str | None = None,
     metadata_path: str | None = None,
     max_points: int = 5000,
+    capture_mode: Literal["immediate", "configured"] = "immediate",
+    restore_trmd: bool = True,
 ) -> dict[str, Any]:
-    """Download waveform data through candidate SDS waveform commands and save CSV."""
+    """Download waveform data and save CSV.
 
-    result = _tcp_adapter().get_waveform(
+    capture_mode="immediate" skips WFSU and reads WF? DAT2 from the current
+    stopped frame. Use capture_mode="configured" only for stable/repetitive
+    signals where WFSU-selected waveform memory is desired.
+    """
+
+    result = get_waveform_with_mode(
+        _tcp_adapter(),
         channel=channel,
         csv_path=csv_path,
         metadata_path=metadata_path,
         max_points=max_points,
+        capture_mode=capture_mode,
+        restore_trmd=restore_trmd,
     )
     return {
         "csv_path": result.csv_path,
@@ -397,7 +408,7 @@ def project_status() -> dict[str, Any]:
             "*IDN? identity query",
             "CHDR OFF header suppression",
             "SCDP screen capture returning BMP/raw image bytes",
-            "WF? DAT2 waveform data read with WFSU SP,1,NP,0,FP,0",
+            "WF? DAT2 waveform data read without WFSU for stopped-frame preservation",
             "WF? DESC WAVEDESC descriptor read and adaptive decode",
             "measurement-driven auto_setup can find and range active signals",
             "low-amplitude periodic signals accepted with valid FREQ/PER evidence",
@@ -405,7 +416,8 @@ def project_status() -> dict[str, Any]:
         "known_issues": [
             "C?:TRLV may not take effect on firmware 4.8.12.1.1.6.5; "
             "auto setup does not depend on trigger level by default.",
-            "get_waveform acquisition sequencing is hardware-sensitive; verify after changes.",
+            "WFSU after STOP can replace the stopped frame on SDS824X HD; "
+            "get_waveform_tcp defaults to capture_mode='immediate' to skip WFSU.",
         ],
         "default_auto_setup_behavior": {
             "leave_stopped": True,
@@ -414,6 +426,11 @@ def project_status() -> dict[str, Any]:
             "min_signal_vpp": 0.005,
             "set_trigger_level": False,
             "probe": 10.0,
+        },
+        "default_waveform_capture_behavior": {
+            "capture_mode": "immediate",
+            "wfsu_sent": False,
+            "dt_source_priority": ["WAVEDESC HORIZ_INTERVAL", "SARA fallback", "TDIV fallback"],
         },
         "tcp_tools": [
             "connect_tcp",
@@ -435,7 +452,7 @@ def project_status() -> dict[str, Any]:
             "modbus_rtu_timing",
             "generate_report",
         ],
-        "status_note": "Hardware-tested alpha; auto setup accepts weak periodic signals.",
+        "status_note": "Hardware-tested alpha; waveform capture defaults to immediate no-WFSU mode.",
     }
 
 
