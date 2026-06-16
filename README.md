@@ -53,6 +53,32 @@ Default behavior: `leave_stopped=true`. The tool intentionally leaves the scope 
 
 Compatibility note: `coarse_timebase`, `initial_vdiv`, `max_points`, and `refine_attempts` are accepted by the historical `auto_find_waveform` API so older MCP/CLI callers do not break. The current measurement-driven adapter path owns the actual scanning and refinement logic, so those compatibility fields are reported in JSON but are not directly used by the measurement path.
 
+## Waveform capture modes
+
+`get_waveform_tcp` defaults to `capture_mode="immediate"`.
+
+```text
+STOP -> WF? DAT2
+```
+
+This intentionally skips `WFSU`. SDS824X HD field debugging showed that sending `WFSU SP,1,NP,0,FP,0` after STOP can refresh/replace the stopped frame before `WF? DAT2`, which loses intermittent UART/RS485 bursts and often returns an IDLE frame instead.
+
+For stable/repetitive signals only, callers may request the legacy configured path:
+
+```text
+STOP -> WFSU SP,1,NP,0,FP,0 -> WF? DAT2
+```
+
+Use it through MCP by setting:
+
+```json
+{
+  "capture_mode": "configured"
+}
+```
+
+The metadata records `capture.mode`, `capture.wfsu_sent`, `decode.dt_source`, `parsed.trdl_s`, `parsed.effective_start_s`, `parsed.effective_end_s`, and warnings when fallback timing is used.
+
 ## Architecture
 
 ```
@@ -66,6 +92,9 @@ sds_tcp_adapter.py — SDS800X HD command adapter
   │  channel / acquisition / trigger / measure / screenshot /
   │  waveform capture (WAVEDESC adaptive decode + envelope decimation) /
   │  measurement-driven auto_setup
+  ▼
+waveform_capture.py — immediate/configured WF? DAT2 capture modes
+  │  immediate mode preserves stopped frames by skipping WFSU
   ▼
 tcp_transport.py — RawTcpTransport
   │  socket-level SCPI, IEEE 488.2 binary block parser,
@@ -98,13 +127,17 @@ Tracked in `docs/sds824x-hd-command-matrix.md`. Do NOT expose an untested comman
 
 `WF? DAT2` returns 8-bit signed bytes. Voltage decode queries `WF? DESC` for the WAVEDESC descriptor and uses the descriptor-derived `codes_per_div` with current panel `VDIV? / OFST?` for decoding.
 
+### Timebase and dt policy
+
+DAT2 timing should use WAVEDESC `HORIZ_INTERVAL` whenever available. `SARA?` is recorded as metadata and only used as a fallback. Metadata warnings are emitted when `dt_source` falls back to SARA or TDIV because UART/protocol decoding can be wrong if the fallback does not match the DAT2 memory interval.
+
 ### Min/max envelope decimation
 
 When `max_points` < raw sample count, each bucket outputs min + max voltages instead of naive stride-sampling. Preserves glitches/spikes stride would miss.
 
 ### ARM/STOP behaviour
 
-`get_waveform()` must ensure waveform memory reflects the current panel settings before `WF? DAT2`. This path is still hardware-sensitive; keep validation notes in `docs/sds824x-hd-command-matrix.md` up to date when changing ARM/SINGLE/AUTO behaviour.
+`get_waveform_tcp` immediate mode freezes the current frame with STOP and reads DAT2 directly. This is the default for intermittent signals. The older WFSU path is available only through `capture_mode="configured"`.
 
 ### Trigger level policy
 
@@ -116,6 +149,7 @@ When `max_points` < raw sample count, each bucket outputs min + max voltages ins
 src/siglent_sds_mcp/
   server.py              — MCP tools, auto-reconnect, FastMCP
   sds_tcp_adapter.py     — Command adapter, WAVEDESC decode, envelope, auto_setup
+  waveform_capture.py    — WF? DAT2 capture modes, immediate skips WFSU
   tcp_transport.py       — Raw TCP socket, lock, binary block parser
   auto_setup.py          — Compatibility wrapper for auto_find_waveform API
   uart_analyzer.py       — Offline UART CSV analyzer
@@ -160,6 +194,7 @@ Key test areas:
 - `test_tcp_binary_prefix.py` — `query_binary` IEEE 488.2 / BMP prefix skipping
 - `test_auto_setup.py` — `_pick_vdiv`, `_pick_tdiv`, measurement parser and SCPI number formatting
 - `test_auto_find_compat.py` — weak periodic detection, screen hold, screenshot artifact, compatibility parameters
+- `test_waveform_capture_modes.py` — immediate mode skips WFSU; configured mode sends WFSU with warning
 - `test_tcp_transport_parser.py` — socketpair binary block parsing
 
 ## Target device
