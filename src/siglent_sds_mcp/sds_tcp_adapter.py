@@ -529,20 +529,42 @@ class SDS800XHDTcpAdapter:
         sample_rate = _parse_sample_rate(sara_raw)
 
         # --- 2. 确保波形内存与当前 VDIV/OFST/TDIV 匹配 ---
-        # 仅 STOP 可能捕获到旧设置下的波形数据（WAVEDESC 内嵌 gain 与 VDIV?
-        # 不一致）。不能使用 ARM——ARM 会重置采集到"待触发"状态，在 AUTO 模式
-        # 下不保证立即触发完成。正确做法：利用 AUTO 模式的自动触发，等待至少
-        # 一帧完整采集后 STOP。
+        # 策略：不强制切 SINGLE（SDS824X HD 的 SINGLE 行为不稳定）。
+        # 改为：查询当前 TRMD → STOP → 轮询 SAST? 直到 Stop。
+        # 如果当前已有一帧完整数据（SAST=Stop），STOP 为无操作；
+        # 如果当前正在 AUTO 运行，STOP 会定格最新帧，轮询确认即可。
         prev_trmd = self.transport.query("TRMD?")
-        # 确保完成至少一帧在当前设置下的采集。
-        # 策略：切 SINGLE → ARM 强制触发 → 等待 sweep 时间 → STOP。
-        # 避免 AUTO 模式下 ARM 使仪器进入 Ready 但未触发即被 STOP 打断（DAT2=0）。
-        self.transport.write("TRMD SINGLE")
-        time.sleep(0.05)
-        self.transport.write("ARM")
-        sweep_estimate = max(tdiv * 20.0, 0.2)  # 至少 200ms
-        time.sleep(sweep_estimate)
         self.transport.write("STOP")
+        time.sleep(0.05)
+        # 轮询 SAST? 直到 Stop，最多 3 秒
+        _acquired = False
+        _waited = 0.0
+        while _waited < 3.0:
+            try:
+                sast = self.transport.query("SAST?").strip()
+                if sast in ("Stop", "Trig'd"):
+                    _acquired = True
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.05)
+            _waited += 0.05
+        if not _acquired:
+            # 最后手段：ARM 然后继续轮询
+            self.transport.write("ARM")
+            time.sleep(0.1)
+            _waited = 0.0
+            while _waited < 2.0:
+                try:
+                    sast = self.transport.query("SAST?").strip()
+                    if sast in ("Stop", "Trig'd"):
+                        _acquired = True
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(0.05)
+                _waited += 0.05
+            self.transport.write("STOP")
 
         # --- 3. 下载原始波形数据（必须在 DESC 之前，否则 DAT2 返回 0 字节）---
         # WFSU SP,1：SP=0 会被 SDS824X HD scope 拒绝（scope 保持 SP=1），必须设为 >=1。
