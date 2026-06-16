@@ -33,9 +33,12 @@ def _mock_scope(
     }
 
     def fake_auto_setup(
-        channel: str, *,
-        target_cycles: float = 4.0, settle_s: float = 0.6,
-        set_trigger_level: bool = True,
+        channel: str,
+        *,
+        target_cycles: float = 4.0,
+        settle_s: float = 0.6,
+        screenshot_path: str | None = None,
+        set_trigger_level: bool = False,
     ) -> dict[str, object]:
         return {
             "channel": channel,
@@ -45,7 +48,7 @@ def _mock_scope(
             "probe_steps": [
                 {"stage": "coarse", "pkpk_v": pkpk, "freq_hz": freq, "period_s": period},
             ],
-            "screenshot": {"path": f"/tmp/{channel}_shot.png", "bytes": 2400},
+            "screenshot": {"path": screenshot_path or f"/tmp/{channel}_shot.png", "bytes": 2400},
             "set_trigger_level_passed": set_trigger_level,
         }
 
@@ -73,11 +76,36 @@ def test_auto_find_waveform_wrapper_detects_signal_and_holds_screen() -> None:
     assert result.probe == 1.0
     assert result.result["signal_detected"] is True
     assert result.result["trigger_level_command_sent"] is False
-    scope.auto_setup.assert_called_once_with("C1", target_cycles=4.0, settle_s=0.0, set_trigger_level=False)
+    _, kwargs = scope.auto_setup.call_args
+    assert kwargs["set_trigger_level"] is False
+    assert kwargs["screenshot_path"].endswith(".bmp")
     scope.transport.write.assert_any_call("STOP")
     assert not any(call.args and call.args[0] == "ARM" for call in scope.transport.write.call_args_list)
     # STOP 后不得再调用 configure_acquisition（那会重新进入 AUTO 模式破坏停屏）
     assert not scope.configure_acquisition.called
+
+
+def test_compatibility_parameters_are_reported() -> None:
+    scope = _mock_scope(pkpk=0.5)
+
+    result = auto_find_waveform(
+        scope,
+        channels=["C1"],
+        coarse_timebase="100US",
+        initial_vdiv="500mV",
+        max_points=1234,
+        refine_attempts=7,
+        settle_s=0.0,
+    )
+
+    compat = result.result["compatibility_parameters"]
+    assert compat == {
+        "coarse_timebase": "100US",
+        "initial_vdiv": "500mV",
+        "max_points": 1234,
+        "refine_attempts": 7,
+        "used_by_measurement_path": False,
+    }
 
 
 def test_low_amplitude_periodic_signal_is_accepted() -> None:
@@ -148,6 +176,7 @@ def test_auto_find_waveform_wrapper_reports_no_signal() -> None:
     assert result.found is False
     assert result.confidence == "low"
     assert result.result["scan_attempts"][0]["signal_detected"] is False
+    assert result.result["scan_attempts"][0]["screenshot"] is not None
 
 
 def test_low_amplitude_periodic_signal_picks_correct_vdiv_and_tdiv() -> None:
@@ -170,32 +199,51 @@ def test_multi_channel_returns_first_detected() -> None:
     scope.transport = MagicMock()
 
     def fake_auto_setup(
-        channel: str, *,
-        target_cycles: float = 4.0, settle_s: float = 0.6,
-        set_trigger_level: bool = True,
+        channel: str,
+        *,
+        target_cycles: float = 4.0,
+        settle_s: float = 0.6,
+        screenshot_path: str | None = None,
+        set_trigger_level: bool = False,
     ) -> dict[str, object]:
         if channel == "C1":
             pkpk = 0.0225
             freq = 7890.0
             period = 0.000484
             signal_detected = True
-            final_settings = {"vdiv_v": 5e-3, "offset_v": 30e-3, "tdiv_s": 200e-6, "trigger_level_v": 0.0, "trigger_slope": "POS"}
+            final_settings = {
+                "vdiv_v": 5e-3,
+                "offset_v": 30e-3,
+                "tdiv_s": 200e-6,
+                "trigger_level_v": 0.0,
+                "trigger_slope": "POS",
+            }
         else:
             pkpk = 0.5
             freq = 1000.0
             period = 1e-3
             signal_detected = True
-            final_settings = {"vdiv_v": 0.1, "offset_v": 1.65, "tdiv_s": 1e-3, "trigger_level_v": 0.0, "trigger_slope": "POS"}
+            final_settings = {
+                "vdiv_v": 0.1,
+                "offset_v": 1.65,
+                "tdiv_s": 1e-3,
+                "trigger_level_v": 0.0,
+                "trigger_slope": "POS",
+            }
         return {
             "channel": channel,
             "signal_detected": signal_detected,
             "final_settings": final_settings,
             "measurements": {
-                "pkpk_v": pkpk, "max_v": pkpk / 2, "min_v": -pkpk / 2,
-                "mean_v": 1.65, "frequency_hz": freq, "period_s": period,
+                "pkpk_v": pkpk,
+                "max_v": pkpk / 2,
+                "min_v": -pkpk / 2,
+                "mean_v": 1.65,
+                "frequency_hz": freq,
+                "period_s": period,
             },
             "probe_steps": [],
-            "screenshot": None,
+            "screenshot": {"path": screenshot_path, "bytes": 2400},
         }
 
     scope.auto_setup.side_effect = fake_auto_setup
