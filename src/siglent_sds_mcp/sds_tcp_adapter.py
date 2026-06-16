@@ -423,7 +423,12 @@ class SDS800XHDTcpAdapter:
             period_s = 1.0 / freq
 
         final_tdiv = _pick_tdiv(period_s, cycles=target_cycles) if period_s else best_tdiv
-        final_vdiv = _pick_vdiv(max(pkpk, 0.01))
+
+        # 用精测的 vmax/vmin 计算真实幅值和中心，避免宽时基欠采样导致 pkpk 偏低。
+        # 同时确保信号在 8 格垂直范围内居中、不截断。
+        true_pkpk = (vmax - vmin) if (vmax is not None and vmin is not None) else pkpk
+        true_center = (vmax + vmin) / 2.0 if (vmax is not None and vmin is not None) else vmean
+        final_vdiv = _pick_vdiv(max(true_pkpk, 0.01))
 
         # 记录深度保护
         sara_val = _parse_sample_rate(self.transport.query("SARA?"))
@@ -448,9 +453,9 @@ class SDS800XHDTcpAdapter:
                 break
             final_tdiv = _TDIV_STEPS_S[idx + 1]
 
-        # OFST 居中：+vmean 使信号中心对齐屏幕中心
-        final_ofst = max(min(vmean, final_vdiv * 6), -final_vdiv * 6)
-        trig_level = (vmax + vmin) / 2.0 if (vmax is not None and vmin is not None) else vmean
+        # OFST 居中：用精测 vmax/vmin 中点使信号完整显示在屏幕中央
+        final_ofst = max(min(true_center, final_vdiv * 6), -final_vdiv * 6)
+        trig_level = true_center
 
         self.configure_channel(ch, vdiv=_fmt_sci(final_vdiv), offset=_fmt_sci(final_ofst))
         acq_kwargs: dict[str, Any] = {
@@ -464,6 +469,16 @@ class SDS800XHDTcpAdapter:
             acq_kwargs["trigger_level"] = _fmt_sci(trig_level)
         self.configure_acquisition(**acq_kwargs)
         _wait_trigger(timeout=settle_s)
+
+        # --- Step 4.5: VDIV 余量验证 ---
+        # 宽时基扫描阶段测到的 pkpk 对高频信号可能偏低（欠采样）。
+        # 在最终 tdiv 下重新测量 PKPK，若信号超出 7.5 格屏幕，则放大 VDIV。
+        verify_pkpk_samples = _poll_meas("PKPK", n=3, interval=0.1)
+        verify_pkpk = max(verify_pkpk_samples) if verify_pkpk_samples else true_pkpk
+        if verify_pkpk > final_vdiv * 7.5:
+            final_vdiv = _pick_vdiv(verify_pkpk * 1.1)
+            self.configure_channel(ch, vdiv=_fmt_sci(final_vdiv))
+            time.sleep(0.1)
 
         # --- Step 5: 可选截图确认屏幕显示 ---
         shot: dict[str, Any] | None = None
