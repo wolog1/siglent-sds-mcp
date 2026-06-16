@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal
 
+from .artifacts import default_artifact_paths
 from .sds_tcp_adapter import (
     Channel,
     SDS800XHDTcpAdapter,
@@ -18,6 +19,7 @@ def _as_float(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
 
 SignalHint = Literal["unknown", "uart", "rs485", "modbus", "pwm", "clock"]
 MIN_PERIODIC_SIGNAL_VPP = 0.005
@@ -74,18 +76,28 @@ def auto_find_waveform(
     robust tdiv-scan + multi-sample measurement pipeline, then applies
     user-configurable thresholds (``noise_floor_v`` / ``min_signal_vpp``) and
     post-capture behaviour (``leave_stopped`` / ``set_trigger_level``).
+
+    ``coarse_timebase``, ``initial_vdiv``, ``max_points`` and ``refine_attempts``
+    are kept to avoid breaking older MCP/CLI callers. The current
+    measurement-driven adapter path owns the actual scanning/refinement logic.
     """
 
     candidate_channels: list[Channel] = channels or ["C1", "C2", "C3", "C4"]
     attempts: list[dict[str, object]] = []
+
+    compatibility_parameters = {
+        "coarse_timebase": coarse_timebase,
+        "initial_vdiv": initial_vdiv,
+        "max_points": max_points,
+        "refine_attempts": refine_attempts,
+        "used_by_measurement_path": False,
+    }
 
     for channel in candidate_channels:
         result = _auto_setup_one_channel(
             scope=scope,
             channel=channel,
             signal_hint=signal_hint,
-            coarse_timebase=coarse_timebase,
-            initial_vdiv=initial_vdiv,
             noise_floor_v=noise_floor_v,
             min_signal_vpp=min_signal_vpp,
             settle_s=settle_s,
@@ -93,6 +105,7 @@ def auto_find_waveform(
             leave_stopped=leave_stopped,
             set_trigger_level=set_trigger_level,
         )
+        result["compatibility_parameters"] = compatibility_parameters
         attempts.append(result)
         if bool(result.get("signal_detected")):
             # Break circular reference: the last entry in attempts *is* result,
@@ -112,8 +125,9 @@ def auto_find_waveform(
                 result=result,
                 notes=[
                     "auto_find_waveform compatibility wrapper used measurement-driven auto setup.",
-                    "max_points and refine_attempts are accepted for backwards compatibility; "
-                    "the current path relies on scope measurements and final screen hold.",
+                    "coarse_timebase, initial_vdiv, max_points and refine_attempts are "
+                    "accepted for backwards compatibility but are not directly used by the "
+                    "current measurement-driven adapter path.",
                 ],
             )
 
@@ -126,7 +140,10 @@ def auto_find_waveform(
         leave_stopped=leave_stopped,
         trigger_level_command_sent=set_trigger_level,
         probe=probe,
-        result={"scan_attempts": attempts},
+        result={
+            "scan_attempts": attempts,
+            "compatibility_parameters": compatibility_parameters,
+        },
         notes=["No active waveform detected on scanned channels."],
     )
 
@@ -136,8 +153,6 @@ def _auto_setup_one_channel(
     scope: SDS800XHDTcpAdapter,
     channel: Channel,
     signal_hint: SignalHint,
-    coarse_timebase: str,
-    initial_vdiv: str,
     noise_floor_v: float,
     min_signal_vpp: float,
     settle_s: float,
@@ -151,10 +166,12 @@ def _auto_setup_one_channel(
     scope.configure_channel(channel, probe=probe)
     time.sleep(0.05)
 
+    screenshot_path = default_artifact_paths(f"auto_setup_{channel.lower()}")["screenshot_raw"]
     raw = scope.auto_setup(
         channel,
         target_cycles=4.0,
         settle_s=settle_s,
+        screenshot_path=screenshot_path,
         set_trigger_level=set_trigger_level,
     )
 
@@ -180,6 +197,7 @@ def _auto_setup_one_channel(
             "noise_floor_v": noise_floor_v,
             "min_signal_vpp": min_signal_vpp,
             "probe_steps": raw.get("probe_steps", []),
+            "screenshot": raw.get("screenshot"),
             "reason": detection["reason"],
         }
 
