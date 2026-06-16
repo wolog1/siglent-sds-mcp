@@ -176,6 +176,7 @@ def _run_auto_setup(
     initial_vdiv: str,
     max_points: int,
     noise_floor_v: float,
+    min_signal_vpp: float,
     settle_s: float,
     probe: float,
     refine_attempts: int,
@@ -190,6 +191,7 @@ def _run_auto_setup(
         initial_vdiv=initial_vdiv,
         max_points=max_points,
         noise_floor_v=noise_floor_v,
+        min_signal_vpp=min_signal_vpp,
         settle_s=settle_s,
         probe=probe,
         refine_attempts=refine_attempts,
@@ -204,6 +206,8 @@ def auto_setup_tcp(
     channel: Literal["C1", "C2", "C3", "C4"] = "C1",
     signal_hint: Literal["unknown", "uart", "rs485", "modbus", "pwm", "clock"] = "unknown",
     settle_s: float = 0.6,
+    noise_floor_v: float = 0.05,
+    min_signal_vpp: float = 0.005,
     probe: float = 10.0,
     leave_stopped: bool = True,
     set_trigger_level: bool = False,
@@ -216,7 +220,8 @@ def auto_setup_tcp(
         coarse_timebase="1MS",
         initial_vdiv="1V",
         max_points=2000,
-        noise_floor_v=0.05,
+        noise_floor_v=noise_floor_v,
+        min_signal_vpp=min_signal_vpp,
         settle_s=settle_s,
         probe=probe,
         refine_attempts=1,
@@ -280,6 +285,7 @@ def auto_find_waveform_tcp(
     initial_vdiv: str = "1V",
     max_points: int = 2000,
     noise_floor_v: float = 0.05,
+    min_signal_vpp: float = 0.005,
     probe: float = 10.0,
     refine_attempts: int = 3,
     leave_stopped: bool = True,
@@ -294,6 +300,7 @@ def auto_find_waveform_tcp(
         initial_vdiv=initial_vdiv,
         max_points=max_points,
         noise_floor_v=noise_floor_v,
+        min_signal_vpp=min_signal_vpp,
         settle_s=0.6,
         probe=probe,
         refine_attempts=refine_attempts,
@@ -393,6 +400,7 @@ def project_status() -> dict[str, Any]:
             "WF? DAT2 waveform data read with WFSU SP,1,NP,0,FP,0",
             "WF? DESC WAVEDESC descriptor read and adaptive decode",
             "measurement-driven auto_setup can find and range active signals",
+            "low-amplitude periodic signals accepted with valid FREQ/PER evidence",
         ],
         "known_issues": [
             "C?:TRLV may not take effect on firmware 4.8.12.1.1.6.5; "
@@ -402,6 +410,8 @@ def project_status() -> dict[str, Any]:
         "default_auto_setup_behavior": {
             "leave_stopped": True,
             "screen_hold": "scope remains stopped on final visible frame",
+            "noise_floor_v": 0.05,
+            "min_signal_vpp": 0.005,
             "set_trigger_level": False,
             "probe": 10.0,
         },
@@ -425,7 +435,7 @@ def project_status() -> dict[str, Any]:
             "modbus_rtu_timing",
             "generate_report",
         ],
-        "status_note": "Hardware-tested alpha; auto setup now has unified MCP entry points.",
+        "status_note": "Hardware-tested alpha; auto setup accepts weak periodic signals.",
     }
 
 
