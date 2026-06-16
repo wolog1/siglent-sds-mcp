@@ -32,7 +32,11 @@ def _mock_scope(
         "trigger_slope": "POS",
     }
 
-    def fake_auto_setup(channel: str, *, target_cycles: float = 4.0, settle_s: float = 0.6) -> dict[str, object]:
+    def fake_auto_setup(
+        channel: str, *,
+        target_cycles: float = 4.0, settle_s: float = 0.6,
+        set_trigger_level: bool = True,
+    ) -> dict[str, object]:
         return {
             "channel": channel,
             "signal_detected": signal_detected,
@@ -42,6 +46,7 @@ def _mock_scope(
                 {"stage": "coarse", "pkpk_v": pkpk, "freq_hz": freq, "period_s": period},
             ],
             "screenshot": {"path": f"/tmp/{channel}_shot.png", "bytes": 2400},
+            "set_trigger_level_passed": set_trigger_level,
         }
 
     scope.auto_setup.side_effect = fake_auto_setup
@@ -68,9 +73,11 @@ def test_auto_find_waveform_wrapper_detects_signal_and_holds_screen() -> None:
     assert result.probe == 1.0
     assert result.result["signal_detected"] is True
     assert result.result["trigger_level_command_sent"] is False
-    scope.auto_setup.assert_called_once_with("C1", target_cycles=4.0, settle_s=0.0)
+    scope.auto_setup.assert_called_once_with("C1", target_cycles=4.0, settle_s=0.0, set_trigger_level=False)
     scope.transport.write.assert_any_call("STOP")
     assert not any(call.args and call.args[0] == "ARM" for call in scope.transport.write.call_args_list)
+    # STOP 后不得再调用 configure_acquisition（那会重新进入 AUTO 模式破坏停屏）
+    assert not scope.configure_acquisition.called
 
 
 def test_low_amplitude_periodic_signal_is_accepted() -> None:
@@ -109,6 +116,25 @@ def test_auto_find_waveform_wrapper_can_restart_when_requested() -> None:
     scope.transport.write.assert_any_call("ARM")
 
 
+def test_set_trigger_level_false_is_passed_to_underlying_auto_setup() -> None:
+    scope = _mock_scope(pkpk=0.5)
+
+    result = auto_find_waveform(
+        scope,
+        channels=["C1"],
+        settle_s=0.0,
+        set_trigger_level=False,
+    )
+
+    assert result.found is True
+    assert result.result["trigger_level_command_sent"] is False
+    # verify the param was forwarded to the underlying auto_setup
+    _, kwargs = scope.auto_setup.call_args
+    assert kwargs.get("set_trigger_level") is False
+    # and no post-hoc configure_acquisition was issued
+    assert not scope.configure_acquisition.called
+
+
 def test_auto_find_waveform_wrapper_reports_no_signal() -> None:
     scope = _mock_scope(pkpk=0.001, freq=None, period=None, signal_detected=False)
 
@@ -143,7 +169,11 @@ def test_multi_channel_returns_first_detected() -> None:
     scope = MagicMock(spec=SDS800XHDTcpAdapter)
     scope.transport = MagicMock()
 
-    def fake_auto_setup(channel: str, *, target_cycles: float = 4.0, settle_s: float = 0.6) -> dict[str, object]:
+    def fake_auto_setup(
+        channel: str, *,
+        target_cycles: float = 4.0, settle_s: float = 0.6,
+        set_trigger_level: bool = True,
+    ) -> dict[str, object]:
         if channel == "C1":
             pkpk = 0.0225
             freq = 7890.0

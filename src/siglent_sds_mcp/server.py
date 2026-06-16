@@ -211,6 +211,8 @@ def auto_setup_tcp(
     probe: float = 10.0,
     leave_stopped: bool = True,
     set_trigger_level: bool = False,
+    noise_floor_v: float = 0.05,
+    min_signal_vpp: float = 0.005,
 ) -> dict[str, object]:
     """Auto setup one channel and leave the waveform visible by default."""
 

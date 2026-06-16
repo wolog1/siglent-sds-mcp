@@ -155,6 +155,7 @@ def _auto_setup_one_channel(
         channel,
         target_cycles=4.0,
         settle_s=settle_s,
+        set_trigger_level=set_trigger_level,
     )
 
     pkpk = float(raw.get("measurements", {}).get("pkpk_v") or 0.0)
@@ -195,25 +196,16 @@ def _auto_setup_one_channel(
             "reason": detection["reason"],
         }
 
-    # Post-capture behaviour
+    # Post-capture behaviour.
+    # When leave_stopped=True we freeze the current frame with STOP and do NOT
+    # touch any acquisition settings afterwards (no TRMD AUTO, no ARM).  This
+    # guarantees the screen stays on the final waveform.
     if leave_stopped:
         scope.transport.write("STOP")
         time.sleep(0.05)
     else:
         scope.transport.write("ARM")
         time.sleep(0.05)
-
-    # If the caller does not want us to touch trigger level, override the
-    # level set by the underlying auto_setup with a no-op (None).
-    if not set_trigger_level:
-        scope.configure_acquisition(
-            command="run" if not leave_stopped else "auto",
-            trigger_mode="AUTO",
-            trigger_source=channel,
-            trigger_level=None,
-            trigger_slope=_trigger_slope(signal_hint),
-        )
-        time.sleep(0.1)
 
     final_status = scope.get_acquisition_status()
     final_channel = scope.get_channel(channel)

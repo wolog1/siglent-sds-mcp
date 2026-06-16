@@ -295,6 +295,7 @@ class SDS800XHDTcpAdapter:
         target_cycles: float = 4.0,
         settle_s: float = 0.6,
         screenshot_path: str | Path | None = None,
+        set_trigger_level: bool = True,
     ) -> dict[str, Any]:
         """自动探测信号并把波形调整到屏幕最佳显示（类似面板 Auto Setup）。
 
@@ -430,7 +431,19 @@ class SDS800XHDTcpAdapter:
             est_pts = int(sara_val * final_tdiv * _AUTOSET_DIVISIONS_H)
             if est_pts >= 100:
                 break
-            idx = _TDIV_STEPS_S.index(final_tdiv)
+            # 安全查找：final_tdiv 可能来自 _TDIV_SCAN_S 而不在 _TDIV_STEPS_S 中
+            idx = -1
+            for i, step in enumerate(_TDIV_STEPS_S):
+                if step == final_tdiv:
+                    idx = i
+                    break
+            if idx < 0:
+                # 不在表中，找下一个更大的档
+                for step in _TDIV_STEPS_S:
+                    if step > final_tdiv:
+                        final_tdiv = step
+                        break
+                break
             if idx + 1 >= len(_TDIV_STEPS_S):
                 break
             final_tdiv = _TDIV_STEPS_S[idx + 1]
@@ -440,14 +453,16 @@ class SDS800XHDTcpAdapter:
         trig_level = (vmax + vmin) / 2.0 if (vmax is not None and vmin is not None) else vmean
 
         self.configure_channel(ch, vdiv=_fmt_sci(final_vdiv), offset=_fmt_sci(final_ofst))
-        self.configure_acquisition(
-            timebase=_fmt_sci(final_tdiv),
-            trigger_source=ch,
-            trigger_level=_fmt_sci(trig_level),
-            trigger_slope="POS",
-            trigger_mode="AUTO",
-            command="run",
-        )
+        acq_kwargs: dict[str, Any] = {
+            "timebase": _fmt_sci(final_tdiv),
+            "trigger_source": ch,
+            "trigger_slope": "POS",
+            "trigger_mode": "AUTO",
+            "command": "run",
+        }
+        if set_trigger_level:
+            acq_kwargs["trigger_level"] = _fmt_sci(trig_level)
+        self.configure_acquisition(**acq_kwargs)
         _wait_trigger(timeout=settle_s)
 
         # --- Step 5: 可选截图确认屏幕显示 ---
