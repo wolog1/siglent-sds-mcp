@@ -228,3 +228,24 @@ def test_too_weak_even_with_periodic_evidence_is_rejected() -> None:
     assert result.found is False
     assert result.result["scan_attempts"][0]["signal_detected"] is False
     assert result.result["scan_attempts"][0]["periodic_evidence"] is True
+
+
+def test_weak_periodic_accepted_even_if_underlying_auto_setup_reports_false() -> None:
+    # 底层 auto_setup 认为 signal_detected=false，但测量值仍支持弱周期信号
+    scope = _mock_scope(pkpk=0.0225, freq=7890.0, period=0.000484, signal_detected=False)
+
+    result = auto_find_waveform(
+        scope,
+        channels=["C1"],
+        settle_s=0.0,
+        noise_floor_v=0.05,
+        min_signal_vpp=0.005,
+    )
+
+    assert result.found is True
+    assert result.confidence == "low"
+    assert result.result["signal_detected"] is True
+    assert result.result["periodic_evidence"] is True
+    assert result.result["reason"] == (
+        "periodic signal accepted below noise_floor_v because frequency/period is valid"
+    )

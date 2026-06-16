@@ -162,19 +162,6 @@ def _auto_setup_one_channel(
     freq = _as_float(raw.get("measurements", {}).get("frequency_hz"))
     per = _as_float(raw.get("measurements", {}).get("period_s"))
 
-    if not bool(raw.get("signal_detected")):
-        return {
-            "channel": channel,
-            "signal_detected": False,
-            "confidence": "low",
-            "measurements": raw.get("measurements", {}),
-            "periodic_evidence": False,
-            "noise_floor_v": noise_floor_v,
-            "min_signal_vpp": min_signal_vpp,
-            "probe_steps": raw.get("probe_steps", []),
-            "reason": "auto_setup reported no detectable signal",
-        }
-
     periodic_evidence = _has_periodic_evidence(frequency_hz=freq, period_s=per)
     detection = _classify_signal(
         pkpk_v=pkpk,
