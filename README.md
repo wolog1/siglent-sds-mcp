@@ -23,7 +23,7 @@ python examples/tcp_idn_test.py <scope-ip>
 
 ## Auto setup — one-command screen setup
 
-The main feature: point at an unknown signal and let the scope measurement engine find usable VDIV / OFST / TDIV settings.
+The main feature: point at an unknown signal and let the scope measurement engine find usable VDIV / OFST / TDIV settings. The command also saves a screenshot artifact from the final setup path.
 
 ```bash
 # Backwards-compatible CLI name; internally uses measurement-driven auto setup
@@ -38,11 +38,20 @@ python examples/auto_find_waveform_tcp.py <scope-ip> \
     --signal-hint clock \
     --probe 1
 
+# Weak periodic signal policy
+python examples/auto_find_waveform_tcp.py <scope-ip> \
+    --channels C1 \
+    --signal-hint clock \
+    --noise-floor 0.05 \
+    --min-signal-vpp 0.005
+
 # Restart acquisition after capture only when explicitly requested
 python examples/auto_find_waveform_tcp.py <scope-ip> --restart-after-capture
 ```
 
-Default behavior: `leave_stopped=true`. The tool intentionally leaves the scope stopped on the final visible frame. The return object includes `screen_hold`, `final_panel_state`, `measurements`, `final_settings`, and `probe_steps`.
+Default behavior: `leave_stopped=true`. The tool intentionally leaves the scope stopped on the final visible frame. The return object includes `screen_hold`, `final_panel_state`, `measurements`, `final_settings`, `probe_steps`, `screenshot`, and `compatibility_parameters`.
+
+Compatibility note: `coarse_timebase`, `initial_vdiv`, `max_points`, and `refine_attempts` are accepted by the historical `auto_find_waveform` API so older MCP/CLI callers do not break. The current measurement-driven adapter path owns the actual scanning and refinement logic, so those compatibility fields are reported in JSON but are not directly used by the measurement path.
 
 ## Architecture
 
@@ -81,6 +90,10 @@ Tracked in `docs/sds824x-hd-command-matrix.md`. Do NOT expose an untested comman
 
 `SDS800XHDTcpAdapter.auto_setup()` uses scope measurements (`PKPK`, `MEAN`, `FREQ`, `PER`, `MAX`, `MIN`) to select display settings. This avoids relying on a separate offline CSV analyzer for first-pass screen setup.
 
+### Weak periodic signal policy
+
+`noise_floor_v` is treated as the strong-signal threshold. A lower-amplitude signal can still be accepted when the scope reports a valid `FREQ` or `PER` and `PKPK >= min_signal_vpp`. This handles real field observations such as a stable 7.89 kHz signal with only about 22.5 mV peak-to-peak.
+
 ### WAVEDESC adaptive decode
 
 `WF? DAT2` returns 8-bit signed bytes. Voltage decode queries `WF? DESC` for the WAVEDESC descriptor and uses the descriptor-derived `codes_per_div` with current panel `VDIV? / OFST?` for decoding.
@@ -95,7 +108,7 @@ When `max_points` < raw sample count, each bucket outputs min + max voltages ins
 
 ### Trigger level policy
 
-`C?:TRLV <level>` is a known issue on SDS824X HD firmware `4.8.12.1.1.6.5`. Display-oriented auto setup should not depend on this command by default.
+`C?:TRLV <level>` is a known issue on SDS824X HD firmware `4.8.12.1.1.6.5`. Display-oriented auto setup does not depend on this command by default. `set_trigger_level=true` must be requested explicitly.
 
 ## Project structure
 
@@ -146,6 +159,7 @@ Key test areas:
 - `test_wavedesc.py` / `test_wavedesc_parser.py` — synthetic WAVEDESC decode, ASCII prefix handling
 - `test_tcp_binary_prefix.py` — `query_binary` IEEE 488.2 / BMP prefix skipping
 - `test_auto_setup.py` — `_pick_vdiv`, `_pick_tdiv`, measurement parser and SCPI number formatting
+- `test_auto_find_compat.py` — weak periodic detection, screen hold, screenshot artifact, compatibility parameters
 - `test_tcp_transport_parser.py` — socketpair binary block parsing
 
 ## Target device
