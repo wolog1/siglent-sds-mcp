@@ -79,6 +79,22 @@ Use it through MCP by setting:
 
 The metadata records `capture.mode`, `capture.wfsu_sent`, `decode.dt_source`, `parsed.trdl_s`, `parsed.effective_start_s`, `parsed.effective_end_s`, and warnings when fallback timing is used.
 
+## UART decoding
+
+`analyze_uart_csv_file` now performs real UART 8N1 byte decoding instead of only reporting edge timing. It detects falling-edge start bits, samples 8 data bits LSB-first, validates the stop bit, and returns decoded bytes:
+
+```json
+{
+  "decoded_hex": "48 69",
+  "decoded_ascii": "Hi",
+  "frames": [
+    {"byte_hex": "0x48", "stop_ok": true, "framing_ok": true}
+  ]
+}
+```
+
+Thresholding is histogram-based when two voltage levels are visible, with min/max midpoint fallback. This is more robust for small-amplitude UART such as high=5.2 V and low=4.95 V, where simple min/max Vpp rules are too brittle.
+
 ## Architecture
 
 ```
@@ -152,7 +168,7 @@ src/siglent_sds_mcp/
   waveform_capture.py    — WF? DAT2 capture modes, immediate skips WFSU
   tcp_transport.py       — Raw TCP socket, lock, binary block parser
   auto_setup.py          — Compatibility wrapper for auto_find_waveform API
-  uart_analyzer.py       — Offline UART CSV analyzer
+  uart_analyzer.py       — Offline UART CSV analyzer and 8N1 byte decoder
   rs485_analyzer.py      — RS485 differential pair analyzer
   modbus_timing.py       — Modbus RTU timing calculator
   report.py              — Markdown field report generator
@@ -195,6 +211,7 @@ Key test areas:
 - `test_auto_setup.py` — `_pick_vdiv`, `_pick_tdiv`, measurement parser and SCPI number formatting
 - `test_auto_find_compat.py` — weak periodic detection, screen hold, screenshot artifact, compatibility parameters
 - `test_waveform_capture_modes.py` — immediate mode skips WFSU; configured mode sends WFSU with warning
+- `test_uart_decoder.py` — UART 8N1 byte decoding, hex/ascii output, low-Vpp thresholding
 - `test_tcp_transport_parser.py` — socketpair binary block parsing
 
 ## Target device
