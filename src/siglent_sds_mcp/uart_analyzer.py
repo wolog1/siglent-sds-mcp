@@ -134,7 +134,22 @@ def analyze_uart_csv(csv_path: str | Path, baudrate: int = 2_000_000) -> UartAna
     if idle_state != 1:
         warnings.append("estimated idle state is not high; UART polarity may be inverted or frame truncated")
 
-    frames = _decode_uart_8n1(logic, expected_bit_time_s, idle_high=True)
+    # Estimate actual bit time from run-length statistics.
+    # Run-length = duration of a constant-level segment; each run is an integer
+    # number of bit times.  Runs whose length is within ±15% of expected_bit_time_s
+    # are treated as single-bit runs and averaged to obtain the measured bit time.
+    # This compensates for crystal-tolerance deviations (commonly up to ±5%).
+    actual_bit_time_s = _estimate_bit_time_from_runs(logic, expected_bit_time_s)
+    if abs(actual_bit_time_s - expected_bit_time_s) / expected_bit_time_s > 0.03:
+        actual_baud = int(round(1.0 / actual_bit_time_s))
+        warnings.append(
+            f"measured bit time {actual_bit_time_s * 1e6:.2f} µs differs from nominal "
+            f"{expected_bit_time_s * 1e6:.2f} µs by "
+            f"{(actual_bit_time_s - expected_bit_time_s) / expected_bit_time_s * 100:.1f}%; "
+            f"using measured value (≈{actual_baud} baud) for decoding"
+        )
+
+    frames = _decode_uart_8n1(logic, actual_bit_time_s, idle_high=True)
     decoded_bytes = [frame.byte for frame in frames if frame.byte is not None and frame.framing_ok]
     decoded_hex = " ".join(f"{byte:02X}" for byte in decoded_bytes)
     decoded_ascii = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in decoded_bytes)
@@ -294,7 +309,12 @@ def _decode_uart_8n1(
                     reason=reason,
                 )
             )
-            i = _first_index_after(logic, start_t + 10.0 * bit_time_s, start=i)
+            # Jump past D7 but not past the stop bit, so the loop can scan
+            # forward and find the next HIGH→LOW start edge without risk of
+            # the jump target landing exactly on (and thus skipping) the very
+            # first sample of the following start bit.  9.0× lands mid-stop-bit
+            # region, which is always safely before the next start-bit edge.
+            i = _first_index_after(logic, start_t + 9.0 * bit_time_s, start=i)
         else:
             i += 1
     return frames
@@ -319,6 +339,63 @@ def _first_index_after(logic: list[tuple[float, int]], t: float, *, start: int =
     while idx < len(logic) and logic[idx][0] <= t:
         idx += 1
     return idx
+
+
+def _estimate_bit_time_from_runs(
+    logic: list[tuple[float, int]],
+    expected_bit_time_s: float,
+) -> float:
+    """Estimate actual bit time by averaging single-bit run durations.
+
+    Builds the run-length sequence from *logic* (list of (time, level) pairs
+    with uniform spacing) and collects runs whose duration falls within ±15% of
+    *expected_bit_time_s*.  These are single-bit runs; their mean duration is
+    the measured bit time.  Falls back to *expected_bit_time_s* when fewer than
+    3 single-bit runs are found (e.g. constant signal, too few edges).
+
+    The returned value is snapped to the nearest integer multiple of the
+    sample interval *dt* (inferred from the first two logic samples).  This
+    prevents a tiny floating-point upward bias in the average from causing
+    ``start_t + 10 * bit_time`` to overshoot the exact timestamp of the next
+    start bit and skip it in ``_first_index_after``.
+    """
+    if len(logic) < 2:
+        return expected_bit_time_s
+
+    # Infer sample interval from the first two timestamps.
+    dt = logic[1][0] - logic[0][0]
+
+    lo = expected_bit_time_s * 0.85
+    hi = expected_bit_time_s * 1.15
+
+    single_bit_durations: list[float] = []
+    run_start_t = logic[0][0]
+    run_level = logic[0][1]
+    for t, level in logic[1:]:
+        if level != run_level:
+            duration = t - run_start_t
+            if lo <= duration <= hi:
+                single_bit_durations.append(duration)
+            run_start_t = t
+            run_level = level
+    # last run
+    duration = logic[-1][0] - run_start_t
+    if lo <= duration <= hi:
+        single_bit_durations.append(duration)
+
+    if len(single_bit_durations) < 3:
+        return expected_bit_time_s
+
+    raw_mean = sum(single_bit_durations) / len(single_bit_durations)
+
+    # Snap to the nearest integer number of samples so that the inferred bit
+    # time aligns with the sample grid.  This avoids a systematic upward bias
+    # (from floating-point accumulation in the sample timestamps) causing the
+    # jump target ``start_t + 10 * bit_time`` to overshoot the next start bit.
+    if dt > 0:
+        n_samples = round(raw_mean / dt)
+        return n_samples * dt
+    return raw_mean
 
 
 def _detect_threshold_edges(samples: list[tuple[float, float]], threshold: float) -> list[float]:

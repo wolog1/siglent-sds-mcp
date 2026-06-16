@@ -77,3 +77,25 @@ def test_low_vpp_uart_still_decodes_with_warning(tmp_path: Path) -> None:
     assert result.decoded_hex == "41"
     assert result.estimated_vpp is not None
     assert result.estimated_vpp < 0.25
+
+
+def test_decode_with_5pct_baud_deviation(tmp_path: Path) -> None:
+    """5% crystal deviation: actual baud 121026 but caller passes 115200.
+
+    The run-length estimator should recover the measured bit time and decode
+    correctly, emitting a warning about the deviation.
+    """
+    csv_path = tmp_path / "uart_5pct_dev.csv"
+    # actual bit time is 5% shorter than 115200 nominal → ~121026 baud
+    actual_baudrate = int(115200 * 1.05)
+    _write_uart_csv(csv_path, b"jintainshigehaorizhi\r\n", baudrate=actual_baudrate,
+                    high_v=3.3, low_v=0.0, sample_per_bit=20)
+
+    result = analyze_uart_csv(csv_path, baudrate=115200)
+
+    assert result.decoded_bytes == list(b"jintainshigehaorizhi\r\n"), (
+        f"decoded: {result.decoded_ascii!r}"
+    )
+    assert result.verdict in ("ok", "partial_decode")
+    # warning must mention measured bit time
+    assert any("measured bit time" in w for w in result.warnings)
