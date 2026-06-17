@@ -312,9 +312,9 @@ def capture_uart_auto(
 
     # ── P1 step 1: measure signal in AUTO mode to get MAX/MIN ──────────────
     _scpi_cmd(transport, f"{channel}:ATTN {probe_attn:.0f}")
-    _scpi_cmd(transport, f"{channel}:VDIV 2V")
-    _scpi_cmd(transport, f"{channel}:OFST 0V")
-    _scpi_cmd(transport, "TDIV 10ms")
+    _scpi_cmd(transport, f"{channel}:VDIV 2.0000E+00V")
+    _scpi_cmd(transport, f"{channel}:OFST 0.0000E+00V")
+    _scpi_cmd(transport, "TDIV 1.0000E-02")   # 10 ms/div
     _scpi_cmd(transport, "TRMD AUTO")
     _scpi_cmd(transport, "ARM")
     time.sleep(1.5)  # let AUTO mode stabilise
@@ -338,22 +338,23 @@ def capture_uart_auto(
             "could not measure MAX/MIN; using default VDIV=2V OFST=-2.5V"
         )
 
-    _scpi_cmd(transport, f"{channel}:VDIV {vdiv:.4g}V")
+    _scpi_cmd(transport, f"{channel}:VDIV {vdiv:.4E}V")
     time.sleep(0.1)
-    _scpi_cmd(transport, f"{channel}:OFST {ofst:.4g}V")
+    _scpi_cmd(transport, f"{channel}:OFST {ofst:.4E}V")
     time.sleep(0.1)
     notes.append(f"VDIV={vdiv:.4g} V/div  OFST={ofst:.4g} V (auto-ranged)")
 
     # ── P4: choose TDIV ────────────────────────────────────────────────────
     baud_for_tdiv = baudrate if baudrate > 0 else 9600  # conservative default
     tdiv = best_tdiv_for_uart(baud_for_tdiv, max_bytes=max_bytes)
-    _scpi_cmd(transport, f"TDIV {tdiv:.4g}")
+    _scpi_cmd(transport, f"TDIV {tdiv:.4E}")
     notes.append(f"TDIV={tdiv * 1e3:.3g} ms/div (auto for {baud_for_tdiv} baud, {max_bytes} B)")
 
     # ── Trigger setup ──────────────────────────────────────────────────────
+    # TRSE syntax: TRSE EDGE,SR,<channel>,DC  (source = channel)
     _scpi_cmd(transport, f"TRSE EDGE,SR,{channel},DC")
     trig_level = (meas_max + meas_min) / 2.0 if (meas_max is not None and meas_min is not None) else 2.5
-    _scpi_cmd(transport, f"{channel}:TRLV {trig_level:.4g}V")
+    _scpi_cmd(transport, f"{channel}:TRLV {trig_level:.4E}V")
     _scpi_cmd(transport, "TRSL NEG")
     _scpi_cmd(transport, "TRMD SINGLE")
 
