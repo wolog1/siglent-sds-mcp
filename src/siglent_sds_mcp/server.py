@@ -491,6 +491,7 @@ def project_status() -> dict[str, Any]:
             "screenshot_tcp",
             "get_waveform_tcp",
             "capture_uart_2mbps_tcp",
+            "capture_uart_auto_tcp",
             "auto_find_waveform_tcp",
             "analyze_uart_csv_file",
             "analyze_rs485_pair_csv_file",

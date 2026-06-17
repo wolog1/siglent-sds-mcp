@@ -475,6 +475,9 @@ def capture_uart_auto(
         f"(confidence={detection.confidence})"
     )
 
+    # Default parity, will be overridden by P2b if candidates tested
+    decode_parity = "8N1"
+
     if baudrate > 0:
         decode_baud = baudrate
         if detection.detected_baud and detection.detected_baud != baudrate:
@@ -486,7 +489,6 @@ def capture_uart_auto(
         decode_baud = detection.detected_baud
     else:
         decode_baud = 9600
-        decode_parity = "8N1"
         warnings.append("baud detection failed; falling back to 9600")
 
     # ── P4 phase-2: re-capture with optimal TDIV if baud was auto-detected ─
