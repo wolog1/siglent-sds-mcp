@@ -1,17 +1,11 @@
 """Tests for uart_capture.py (P1-P5) and auto_detect_baudrate in uart_analyzer.py."""
 from __future__ import annotations
 
-import math
 import struct
-import time
-from collections import Counter
-from typing import Any
 
 import pytest
 
 from siglent_sds_mcp.uart_analyzer import (
-    STANDARD_BAUDS,
-    UartBaudrateDetection,
     auto_detect_baudrate,
 )
 from siglent_sds_mcp.uart_capture import (
@@ -173,7 +167,6 @@ class TestVerifyCpd:
     def test_correct_cpd_unchanged(self):
         # vgain=0.2, cpd=30, codes span=-110..37 → vpp=(147*0.2/30)=0.98 V
         codes = list(range(-110, 38))
-        meas_vpp = 0.98  # close to computed
         corrected, note = verify_cpd(
             30.0, 0.2, codes,
             measured_vmax=0.75, measured_vmin=-0.23,

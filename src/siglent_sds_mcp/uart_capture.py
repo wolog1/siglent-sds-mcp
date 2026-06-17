@@ -538,20 +538,25 @@ def capture_uart_auto(
             for cand in candidates[:5]:  # test top 5 candidates
                 trial_baud = int(cand["baud"])
                 trial_bt = 1.0 / trial_baud
-                # Try 8N1
+                # Try 8N1, 8O1, 8E1
                 frames_8n1 = _decode_uart_8n1(trial_logic, trial_bt, idle_high=True, parity=None)
                 rate_8n1 = sum(f.stop_ok for f in frames_8n1) / len(frames_8n1) if frames_8n1 else 0.0
-                # Try 8O1
                 frames_8o1 = _decode_uart_8n1(trial_logic, trial_bt, idle_high=True, parity="odd")
                 rate_8o1 = sum(f.stop_ok for f in frames_8o1) / len(frames_8o1) if frames_8o1 else 0.0
+                frames_8e1 = _decode_uart_8n1(trial_logic, trial_bt, idle_high=True, parity="even")
+                rate_8e1 = sum(f.stop_ok for f in frames_8e1) / len(frames_8e1) if frames_8e1 else 0.0
                 # Pick best for this baud
-                if rate_8o1 > rate_8n1:
-                    trial_rate = rate_8o1
-                    parity_str = "8O1"
-                else:
-                    trial_rate = rate_8n1
-                    parity_str = "8N1"
-                trial_notes.append(f"  {trial_baud} baud {parity_str}: stop_ok={trial_rate:.1%}")
+                best_rate_for_baud = rate_8n1
+                best_parity_for_baud = "8N1"
+                if rate_8o1 > best_rate_for_baud:
+                    best_rate_for_baud = rate_8o1
+                    best_parity_for_baud = "8O1"
+                if rate_8e1 > best_rate_for_baud:
+                    best_rate_for_baud = rate_8e1
+                    best_parity_for_baud = "8E1"
+                trial_rate = best_rate_for_baud
+                parity_str = best_parity_for_baud
+                trial_notes.append(f"  {trial_baud} baud 8N1={rate_8n1:.1%} 8O1={rate_8o1:.1%} 8E1={rate_8e1:.1%} -> {parity_str}")
                 if trial_rate > best_rate:
                     best_rate = trial_rate
                     best_baud = trial_baud
@@ -563,13 +568,17 @@ def capture_uart_auto(
                 rate_8n1 = sum(f.stop_ok for f in frames_8n1) / len(frames_8n1) if frames_8n1 else 0.0
                 frames_8o1 = _decode_uart_8n1(trial_logic, non_std_bt, idle_high=True, parity="odd")
                 rate_8o1 = sum(f.stop_ok for f in frames_8o1) / len(frames_8o1) if frames_8o1 else 0.0
-                if rate_8o1 > rate_8n1:
+                frames_8e1 = _decode_uart_8n1(trial_logic, non_std_bt, idle_high=True, parity="even")
+                rate_8e1 = sum(f.stop_ok for f in frames_8e1) / len(frames_8e1) if frames_8e1 else 0.0
+                non_std_rate = rate_8n1
+                parity_str = "8N1"
+                if rate_8o1 > non_std_rate:
                     non_std_rate = rate_8o1
                     parity_str = "8O1"
-                else:
-                    non_std_rate = rate_8n1
-                    parity_str = "8N1"
-                trial_notes.append(f"  non-std {non_std_baud} baud {parity_str}: stop_ok={non_std_rate:.1%}")
+                if rate_8e1 > non_std_rate:
+                    non_std_rate = rate_8e1
+                    parity_str = "8E1"
+                trial_notes.append(f"  non-std {non_std_baud} baud 8N1={rate_8n1:.1%} 8O1={rate_8o1:.1%} 8E1={rate_8e1:.1%} -> {parity_str}")
                 if non_std_rate > best_rate:
                     best_rate = non_std_rate
                     best_baud = non_std_baud
@@ -590,7 +599,12 @@ def capture_uart_auto(
     actual_bt = _estimate_bit_time_from_runs(logic, nominal_bt)
     measured_baud = int(round(1.0 / actual_bt))
 
-    parity_param = "odd" if decode_parity == "8O1" else None
+    if decode_parity == "8O1":
+        parity_param = "odd"
+    elif decode_parity == "8E1":
+        parity_param = "even"
+    else:
+        parity_param = None
     frames = _decode_uart_8n1(logic, actual_bt, idle_high=True, parity=parity_param)
     good = [f for f in frames if f.framing_ok and f.byte is not None]
     decoded_bytes = [f.byte for f in good]  # type: ignore[misc]

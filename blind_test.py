@@ -24,9 +24,9 @@ def main() -> int:
         channel="C1",
         baudrate=0,          # auto-detect
         probe_attn=10.0,     # 10x probe
-        max_bytes=64,
+        max_bytes=256,       # 更大数据包
         timeout_s=60.0,
-        min_pkpk_v=0.5,      # lower threshold for 3.3V signals
+        min_pkpk_v=0.5,
         max_trigger_attempts=8,
     )
 
