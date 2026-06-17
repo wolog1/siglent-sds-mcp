@@ -7,7 +7,16 @@ from siglent_sds_mcp import uart_capture
 from siglent_sds_mcp.uart_capture import capture_uart_auto
 
 
-def _uart_dat2_bytes(payload: bytes, *, samples_per_bit: int = 20) -> bytes:
+FALLBACK_WAVEDESC_DT_S = 1e-8
+
+
+def _uart_dat2_bytes(
+    payload: bytes,
+    *,
+    baudrate: int = 115200,
+    dt_s: float = FALLBACK_WAVEDESC_DT_S,
+) -> bytes:
+    samples_per_bit = max(1, round((1.0 / baudrate) / dt_s))
     codes: list[int] = []
 
     def append_level(level: int, bits: int = 1) -> None:
@@ -48,7 +57,7 @@ def test_capture_uart_auto_explicit_baud_does_not_require_decode_parity_assignme
         if command.endswith("WF? DESC"):
             return SimpleNamespace(data=b"short descriptor uses defaults")
         if command.endswith("WF? DAT2"):
-            return SimpleNamespace(data=_uart_dat2_bytes(b"A"))
+            return SimpleNamespace(data=_uart_dat2_bytes(b"A", baudrate=115200))
         raise AssertionError(f"unexpected binary command: {command}")
 
     transport.query.side_effect = fake_query
