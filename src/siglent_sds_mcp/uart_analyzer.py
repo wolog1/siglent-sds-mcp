@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import csv
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import median
 from typing import Literal
 
 ThresholdMethod = Literal["auto_histogram", "midpoint"]
+
+# Standard UART baud rates in ascending order.
+STANDARD_BAUDS: tuple[int, ...] = (
+    1200, 2400, 4800, 9600, 14400, 19200, 28800, 38400,
+    57600, 76800, 115200, 230400, 460800, 921600,
+)
 
 
 @dataclass(slots=True)
@@ -77,6 +84,221 @@ class UartAnalysisResult:
             "warnings": self.warnings,
             "verdict": self.verdict,
         }
+
+
+@dataclass(slots=True)
+class UartBaudrateDetection:
+    """Result of automatic baud-rate detection from raw waveform samples."""
+
+    detected_baud: int | None
+    measured_bit_time_s: float | None
+    confidence: str          # "high" | "medium" | "low" | "none"
+    candidates: list[dict[str, object]]
+    warnings: list[str]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "detected_baud": self.detected_baud,
+            "measured_bit_time_s": self.measured_bit_time_s,
+            "confidence": self.confidence,
+            "candidates": self.candidates,
+            "warnings": self.warnings,
+        }
+
+
+def auto_detect_baudrate(
+    samples: list[tuple[float, float]],
+    *,
+    noise_run_threshold: int = 3,
+    min_stable_runs: int = 5,
+) -> UartBaudrateDetection:
+    """Infer UART baud rate from a raw waveform sample list.
+
+    Algorithm
+    ---------
+    1. Binarise the signal using a histogram double-peak threshold.
+    2. Build the run-length sequence (each entry = number of consecutive
+       samples at the same logic level).
+    3. The shortest *stable* run (occurring at least *noise_run_threshold*
+       times) is the best candidate for a 1-bit period in sample units.
+    4. Convert to seconds using the sample interval *dt* inferred from the
+       first two timestamps.
+    5. Score every standard baud rate by checking whether the shortest
+       stable run equals *n × BP* for small integer *n* (1..11), then rank
+       by how close ratio is to a whole number.
+
+    Returns
+    -------
+    ``UartBaudrateDetection`` with the best guess and a ranked candidate list.
+    """
+    warnings: list[str] = []
+    candidates: list[dict[str, object]] = []
+
+    if len(samples) < 4:
+        return UartBaudrateDetection(
+            detected_baud=None,
+            measured_bit_time_s=None,
+            confidence="none",
+            candidates=[],
+            warnings=["too few samples"],
+        )
+
+    dt = samples[1][0] - samples[0][0]
+    if dt <= 0:
+        return UartBaudrateDetection(
+            detected_baud=None,
+            measured_bit_time_s=None,
+            confidence="none",
+            candidates=[],
+            warnings=["non-positive sample interval"],
+        )
+
+    voltages = [v for _, v in samples]
+    low_v, high_v, threshold, _, thr_warns = _estimate_levels_and_threshold(voltages)
+    warnings.extend(thr_warns)
+    vpp = high_v - low_v
+
+    if vpp < 0.05:
+        warnings.append(f"low Vpp={vpp:.3f} V; baud detection may be unreliable")
+
+    binary = [1 if v >= threshold else 0 for v in voltages]
+
+    # Build run-length table.
+    run_lengths: list[int] = []
+    idx = 0
+    while idx < len(binary):
+        level = binary[idx]
+        j = idx
+        while j < len(binary) and binary[j] == level:
+            j += 1
+        run_lengths.append(j - idx)
+        idx = j
+
+    if not run_lengths:
+        return UartBaudrateDetection(
+            detected_baud=None,
+            measured_bit_time_s=None,
+            confidence="none",
+            candidates=[],
+            warnings=warnings + ["no runs found"],
+        )
+
+    rc = Counter(run_lengths)
+
+    # Physical lower bound: a UART bit at the fastest supported baud rate
+    # (921600) occupies at least 0.5 / (921600 * dt) samples.  Any run
+    # shorter than this cannot be a real UART bit and is treated as noise.
+    fastest_baud = STANDARD_BAUDS[-1]   # 921600
+    min_physical_run = max(1, int(0.5 / (fastest_baud * dt)))
+
+    # Find the shortest run that is:
+    #   (a) longer than the physical noise floor, AND
+    #   (b) appears at least noise_run_threshold times (repeating bit patterns).
+    stable_runs = sorted(
+        r for r, cnt in rc.items()
+        if r >= min_physical_run and cnt >= noise_run_threshold
+    )
+    if not stable_runs:
+        # Relax (b): accept any run above the physical floor.
+        stable_runs = sorted(r for r in rc if r >= min_physical_run)
+    if not stable_runs:
+        # Full fallback — signal may be idle or extremely noisy.
+        stable_runs = sorted(rc.keys())
+        warnings.append(
+            f"no run length appears >= {noise_run_threshold} times above "
+            f"physical noise floor ({min_physical_run} samples); "
+            "baud detection confidence is low"
+        )
+
+    min_run = stable_runs[0]
+    min_run_time_s = min_run * dt
+
+    # ── Score every standard baud rate with a global fit metric ────────────
+    # For each candidate baud, compute how well the *entire* run-length
+    # distribution is explained by integer multiples of one bit period (BP).
+    # A run of length R is "explained" if round(R / BP) ≥ 1 and
+    # |R - round(R/BP)*BP| / BP < tol.  The score is the fraction of run
+    # *occurrences* (weighted by run length, i.e. time) that are explained.
+    # This is far more robust than looking only at min_run, because it
+    # avoids integer-multiple ambiguity (e.g. confusing 57600 with 19200).
+    MATCH_TOL = 0.12          # ±12 % of one bit period
+    MAX_BITS_PER_RUN = 10     # only consider runs up to 10 bits long
+
+    for baud in STANDARD_BAUDS:
+        bp = 1.0 / (baud * dt)   # expected BP in samples (float)
+        total_time = 0
+        matched_time = 0
+        for r, cnt in rc.items():
+            n_bits = round(r / bp)
+            if n_bits < 1 or n_bits > MAX_BITS_PER_RUN:
+                continue
+            total_time += r * cnt
+            err_frac = abs(r - n_bits * bp) / bp
+            if err_frac < MATCH_TOL:
+                matched_time += r * cnt
+
+        if total_time == 0:
+            continue
+        fit = matched_time / total_time   # 0..1, higher = better
+
+        # Only add to candidates when min_run also aligns with this baud.
+        min_n = round(min_run / bp)
+        if min_n < 1 or min_n > MAX_BITS_PER_RUN:
+            continue
+        min_err_frac = abs(min_run - min_n * bp) / bp
+        if min_err_frac >= MATCH_TOL:
+            continue
+
+        measured_bt = min_run / min_n * dt
+        err_pct_val = min_err_frac * 100.0
+        candidates.append({
+            "baud": baud,
+            "n_bits": min_n,
+            "ratio": round(min_run / (min_n * bp), 4),
+            "error_pct": round(err_pct_val, 2),
+            "measured_bit_time_s": measured_bt,
+            "fit_score": round(fit, 4),
+        })
+
+    if not candidates:
+        warnings.append(
+            f"shortest stable run {min_run} ({min_run_time_s * 1e6:.2f} µs) "
+            "does not match any standard baud rate within ±15%"
+        )
+        return UartBaudrateDetection(
+            detected_baud=None,
+            measured_bit_time_s=min_run_time_s,
+            confidence="none",
+            candidates=[],
+            warnings=warnings,
+        )
+
+    # Sort: best fit_score first, then prefer lower n_bits, then lower error.
+    candidates.sort(key=lambda c: (-c["fit_score"], c["n_bits"], c["error_pct"]))
+    best = candidates[0]
+    best_baud: int = int(best["baud"])
+    best_bt: float = float(best["measured_bit_time_s"])
+    err_pct: float = float(best["error_pct"])
+    fit_score: float = float(best["fit_score"])
+
+    if fit_score >= 0.80 and best["n_bits"] == 1 and err_pct < 3.0:
+        confidence = "high"
+    elif fit_score >= 0.60 and err_pct < 8.0:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    if len({c["baud"] for c in candidates}) > 1:
+        alt_bauds = sorted({c["baud"] for c in candidates} - {best_baud})
+        warnings.append(f"multiple baud rate candidates: {[best_baud] + alt_bauds}")
+
+    return UartBaudrateDetection(
+        detected_baud=best_baud,
+        measured_bit_time_s=best_bt,
+        confidence=confidence,
+        candidates=candidates,
+        warnings=warnings,
+    )
 
 
 def analyze_uart_csv(csv_path: str | Path, baudrate: int = 2_000_000) -> UartAnalysisResult:

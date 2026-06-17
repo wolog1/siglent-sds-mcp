@@ -12,6 +12,7 @@ from .rs485_analyzer import analyze_rs485_pair_csv
 from .sds_tcp_adapter import SDS800XHDTcpAdapter
 from .tcp_transport import RawTcpTransport
 from .uart_analyzer import analyze_uart_csv
+from .uart_capture import capture_uart_auto as _capture_uart_auto
 from .waveform_capture import get_waveform_with_mode
 
 mcp = FastMCP("siglent-sds-mcp", json_response=True)
@@ -271,6 +272,50 @@ def get_waveform_tcp(
         "metadata_path": result.metadata_path,
         "metadata": result.metadata,
     }
+
+
+@mcp.tool()
+def capture_uart_auto_tcp(
+    channel: Literal["C1", "C2", "C3", "C4"] = "C1",
+    baudrate: int = 0,
+    probe_attn: float = 10.0,
+    max_bytes: int = 64,
+    timeout_s: float = 60.0,
+    max_trigger_attempts: int = 8,
+    min_pkpk_v: float = 1.0,
+) -> dict[str, Any]:
+    """Capture UART waveform and auto-decode with full self-calibration.
+
+    Features
+    --------
+    - P1: VDIV/OFST auto-ranging from live MAX/MIN measurement.
+    - P2: Baud-rate auto-detection from run-length statistics (baudrate=0).
+    - P3: Noise-trigger retry: re-ARMs when PKPK < min_pkpk_v.
+    - P4: TDIV auto-calculated to fit max_bytes at the given/detected baud rate.
+    - P5: cpd sanity-check: re-derives codes-per-div when WAVEDESC value is off.
+
+    Parameters
+    ----------
+    channel: Oscilloscope channel (default C1).
+    baudrate: Nominal baud rate.  0 = auto-detect.
+    probe_attn: Probe attenuation factor (1 or 10).
+    max_bytes: Estimated maximum message length in bytes (for TDIV sizing).
+    timeout_s: Seconds to wait for a valid trigger.
+    max_trigger_attempts: Re-ARM attempts before giving up.
+    min_pkpk_v: Minimum PKPK (V) to accept a trigger as genuine.
+    """
+    adapter = _tcp_adapter()
+    result = _capture_uart_auto(
+        adapter.transport,
+        channel=channel,
+        baudrate=baudrate,
+        probe_attn=probe_attn,
+        max_bytes=max_bytes,
+        timeout_s=timeout_s,
+        max_trigger_attempts=max_trigger_attempts,
+        min_pkpk_v=min_pkpk_v,
+    )
+    return result.to_dict()
 
 
 @mcp.tool()
