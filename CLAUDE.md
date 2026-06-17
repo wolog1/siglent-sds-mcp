@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Hardware
+
+- **Oscilloscope**: SIGLENT SDS824X HD
+- **IP**: `192.168.0.170`  port `5025` (固定 IP，已确认)
+- **Quick connectivity test**: `ping 192.168.0.170` or `python examples/tcp_idn_test.py 192.168.0.170`
+
 ## Build & dev commands
 
 ```bash

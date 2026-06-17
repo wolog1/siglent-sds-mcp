@@ -344,11 +344,16 @@ def capture_uart_auto(
     time.sleep(0.1)
     notes.append(f"VDIV={vdiv:.4g} V/div  OFST={ofst:.4g} V (auto-ranged)")
 
-    # ── P4: choose TDIV ────────────────────────────────────────────────────
-    baud_for_tdiv = baudrate if baudrate > 0 else 9600  # conservative default
-    tdiv = best_tdiv_for_uart(baud_for_tdiv, max_bytes=max_bytes)
+    # ── P4 phase-1: wide TDIV for initial capture + baud detection ────────
+    # When baudrate is unknown (0) we use a wide 5ms/div window to catch the
+    # first frame, detect the baud rate, then re-capture with the optimal TDIV.
+    if baudrate > 0:
+        tdiv = best_tdiv_for_uart(baudrate, max_bytes=max_bytes)
+        notes.append(f"TDIV={tdiv * 1e3:.3g} ms/div (from supplied baud={baudrate}, {max_bytes} B)")
+    else:
+        tdiv = 5e-3   # 5 ms/div wide capture for baud snooping
+        notes.append("TDIV=5 ms/div (wide capture for baud detection)")
     _scpi_cmd(transport, f"TDIV {tdiv:.4E}")
-    notes.append(f"TDIV={tdiv * 1e3:.3g} ms/div (auto for {baud_for_tdiv} baud, {max_bytes} B)")
 
     # ── Trigger setup ──────────────────────────────────────────────────────
     # TRSE syntax: TRSE EDGE,SR,<channel>,DC  (source = channel)
@@ -392,16 +397,21 @@ def capture_uart_auto(
     meas_max = _scpi_qry_float(transport, f"{channel}:PAVA? MAX")
     meas_min = _scpi_qry_float(transport, f"{channel}:PAVA? MIN")
 
-    # ── Read WAVEDESC ──────────────────────────────────────────────────────
-    desc_block = transport.query_binary(f"{channel}:WF? DESC")  # type: ignore[attr-defined]
-    desc_raw = desc_block.data if hasattr(desc_block, "data") else bytes(desc_block)
-    dt, vgain, voff, cpd = _parse_wavedesc_minimal(desc_raw)
+    def _read_waveform() -> tuple[float, float, float, float, list[int]]:
+        """Read WAVEDESC + DAT2, return (dt, vgain, voff, cpd, codes)."""
+        desc_b = transport.query_binary(f"{channel}:WF? DESC")  # type: ignore[attr-defined]
+        desc_r = desc_b.data if hasattr(desc_b, "data") else bytes(desc_b)
+        _dt, _vg, _vo, _cpd = _parse_wavedesc_minimal(desc_r)
+        dat2_b = transport.query_binary(f"{channel}:WF? DAT2")  # type: ignore[attr-defined]
+        dat2_r = dat2_b.data if hasattr(dat2_b, "data") else bytes(dat2_b)
+        _codes = [b if b <= 127 else b - 256 for b in dat2_r]
+        return _dt, _vg, _vo, _cpd, _codes
+
+    # ── Read WAVEDESC + DAT2 (phase-1) ─────────────────────────────────────
+    dt, vgain, voff, cpd, codes = _read_waveform()
     notes.append(f"WAVEDESC: dt={dt:.3e} s  vgain={vgain:.4f}  voff={voff:.3f} V  cpd={cpd:.1f}")
 
-    # ── Read DAT2 ──────────────────────────────────────────────────────────
-    dat2_block = transport.query_binary(f"{channel}:WF? DAT2")  # type: ignore[attr-defined]
-    dat2_raw = dat2_block.data if hasattr(dat2_block, "data") else bytes(dat2_block)
-    if not dat2_raw:
+    if not codes:
         return UartCaptureResult(
             ok=False,
             channel=channel,
@@ -421,9 +431,6 @@ def capture_uart_auto(
             warnings=warnings + ["DAT2 read returned empty data"],
             notes=notes,
         )
-
-    # ── Convert raw bytes to signed codes ─────────────────────────────────
-    codes = [b if b <= 127 else b - 256 for b in dat2_raw]
 
     # ── P5: verify / correct cpd ──────────────────────────────────────────
     cpd, cpd_note = verify_cpd(cpd, vgain, codes, meas_max, meas_min, voff)
@@ -469,7 +476,6 @@ def capture_uart_auto(
     )
 
     if baudrate > 0:
-        # Caller supplied explicit baud — use it but report detection result.
         decode_baud = baudrate
         if detection.detected_baud and detection.detected_baud != baudrate:
             notes.append(
@@ -481,6 +487,41 @@ def capture_uart_auto(
     else:
         decode_baud = 9600
         warnings.append("baud detection failed; falling back to 9600")
+
+    # ── P4 phase-2: re-capture with optimal TDIV if baud was auto-detected ─
+    # When we detected a baud rate from the wide capture, recalculate the
+    # optimal TDIV and re-ARM for a tighter, higher-resolution capture.
+    if baudrate == 0 and decode_baud != 9600:
+        tdiv2 = best_tdiv_for_uart(decode_baud, max_bytes=max_bytes)
+        if tdiv2 < tdiv * 0.9:   # only re-capture if meaningfully narrower
+            notes.append(
+                f"P4 phase-2: re-capturing at TDIV={tdiv2 * 1e3:.3g} ms/div "
+                f"(optimal for {decode_baud} baud)"
+            )
+            _scpi_cmd(transport, f"TDIV {tdiv2:.4E}")
+            tdiv = tdiv2
+            # Re-ARM (single attempt, valid trigger already confirmed)
+            triggered2 = arm_until_valid(
+                transport,
+                min_pkpk_v=min_pkpk_v,
+                timeout_s=min(timeout_s, 30.0),
+                max_attempts=3,
+                channel=channel,
+            )
+            if triggered2:
+                meas_max = _scpi_qry_float(transport, f"{channel}:PAVA? MAX")
+                meas_min = _scpi_qry_float(transport, f"{channel}:PAVA? MIN")
+                dt, vgain, voff, cpd2, codes = _read_waveform()
+                cpd2, cpd_note2 = verify_cpd(cpd2, vgain, codes, meas_max, meas_min, voff)
+                cpd = cpd2
+                notes.append(f"phase-2 WAVEDESC: dt={dt:.3e} s  cpd check: {cpd_note2}")
+                voltages = [c * (vgain / cpd) - voff for c in codes]
+                low_v, high_v, threshold_v, _, thr_warns2 = _estimate_levels_and_threshold(voltages)
+                warnings.extend(thr_warns2)
+                vpp_v = high_v - low_v
+                binary = [1 if v >= threshold_v else 0 for v in voltages]
+            else:
+                notes.append("phase-2 re-trigger failed; using phase-1 data")
 
     # ── Decode ────────────────────────────────────────────────────────────
     logic = [(i * dt, binary[i]) for i in range(len(binary))]

@@ -12,7 +12,7 @@ ThresholdMethod = Literal["auto_histogram", "midpoint"]
 # Standard UART baud rates in ascending order.
 STANDARD_BAUDS: tuple[int, ...] = (
     1200, 2400, 4800, 9600, 14400, 19200, 28800, 38400,
-    57600, 76800, 115200, 230400, 460800, 921600,
+    57600, 76800, 115200, 230400, 460800, 500000, 921600,
 )
 
 
