@@ -11,7 +11,7 @@ ThresholdMethod = Literal["auto_histogram", "midpoint"]
 
 # Standard UART baud rates in ascending order.
 STANDARD_BAUDS: tuple[int, ...] = (
-    1200, 2400, 4800, 9600, 14400, 19200, 28800, 38400,
+    600, 1200, 2400, 4800, 9600, 14400, 19200, 28800, 38400,
     57600, 76800, 115200, 230400, 460800, 500000, 921600,
     1000000, 1500000, 2000000,
 )
@@ -222,7 +222,7 @@ def auto_detect_baudrate(
     # *occurrences* (weighted by run length, i.e. time) that are explained.
     # This is far more robust than looking only at min_run, because it
     # avoids integer-multiple ambiguity (e.g. confusing 57600 with 19200).
-    MATCH_TOL = 0.12          # ±12 % of one bit period
+    MATCH_TOL = 0.20          # ±20 % of one bit period (covers non-standard rates)
     MAX_BITS_PER_RUN = 10     # only consider runs up to 10 bits long
 
     for baud in STANDARD_BAUDS:
@@ -262,20 +262,43 @@ def auto_detect_baudrate(
         })
 
     if not candidates:
+        # No standard baud matches within tolerance — estimate non-standard rate
+        # assuming the shortest stable run is exactly 1 bit period.
+        estimated_baud = int(round(1.0 / min_run_time_s))
         warnings.append(
             f"shortest stable run {min_run} ({min_run_time_s * 1e6:.2f} µs) "
-            "does not match any standard baud rate within ±15%"
+            "does not match any standard baud rate; "
+            f"estimating non-standard {estimated_baud} baud"
         )
         return UartBaudrateDetection(
-            detected_baud=None,
+            detected_baud=estimated_baud,
             measured_bit_time_s=min_run_time_s,
-            confidence="none",
-            candidates=[],
+            confidence="low",
+            candidates=[{
+                "baud": estimated_baud,
+                "n_bits": 1,
+                "ratio": 1.0,
+                "error_pct": 0.0,
+                "measured_bit_time_s": min_run_time_s,
+                "fit_score": 0.0,
+            }],
             warnings=warnings,
         )
 
     # Sort: best fit_score first, then prefer lower n_bits, then lower error.
-    candidates.sort(key=lambda c: (-c["fit_score"], c["n_bits"], c["error_pct"]))
+    # When fit scores are close (<0.15), prefer lower baud rate for rates <= 9600
+    # to resolve integer-multiple ambiguity (e.g., 600 vs 4800, 1200 vs 2400).
+    # For higher rates, prefer higher baud to avoid picking sub-multiples.
+    def _sort_key(c: dict) -> tuple[float, float, int, float]:
+        fit_band = -round(c["fit_score"] / 0.15)  # higher fit = lower band number
+        baud = c["baud"]
+        # For low baud rates, prefer lower; for high baud, prefer higher
+        if baud <= 9600:
+            return (fit_band, baud, c["n_bits"], c["error_pct"])  # lower baud first
+        else:
+            return (fit_band, -baud, c["n_bits"], c["error_pct"])  # higher baud first
+
+    candidates.sort(key=_sort_key)
     best = candidates[0]
     best_baud: int = int(best["baud"])
     best_bt: float = float(best["measured_bit_time_s"])
@@ -483,13 +506,26 @@ def _decode_uart_8n1(
     bit_time_s: float,
     *,
     idle_high: bool = True,
+    parity: str | None = None,
 ) -> list[UartFrame]:
+    """Decode UART frames.
+
+    Args:
+        logic: List of (time_s, level) samples.
+        bit_time_s: Duration of one bit in seconds.
+        idle_high: True if idle state is high (typical TTL UART).
+        parity: None for 8N1, "odd" for 8O1, "even" for 8E1.
+    """
     frames: list[UartFrame] = []
     if len(logic) < 2 or bit_time_s <= 0:
         return frames
 
     idle = 1 if idle_high else 0
     start_level = 0 if idle_high else 1
+    has_parity = parity in ("odd", "even")
+    stop_sample_offset = 10.5 if has_parity else 9.5
+    jump_offset = 10.0 if has_parity else 9.0
+
     i = 1
     while i < len(logic):
         prev_state = logic[i - 1][1]
@@ -507,9 +543,20 @@ def _decode_uart_8n1(
                     reason = "data bit sample outside waveform"
                     break
                 bits.append(bit)
+
+            # Parity bit (if present)
+            parity_bit = None
+            if ok and has_parity:
+                parity_t = start_t + 9.5 * bit_time_s
+                parity_bit = _sample_logic_at(logic, parity_t)
+                if parity_bit is None:
+                    ok = False
+                    reason = "parity bit sample outside waveform"
+
+            # Stop bit
             stop_bit = None
             if ok:
-                stop_t = start_t + 9.5 * bit_time_s
+                stop_t = start_t + stop_sample_offset * bit_time_s
                 stop_bit = _sample_logic_at(logic, stop_t)
                 if stop_bit is None:
                     ok = False
@@ -520,7 +567,7 @@ def _decode_uart_8n1(
 
             byte = None
             if bits:
-                byte = sum(bit << bit_index for bit_index, bit in enumerate(bits))
+                byte = sum(int(bit) << bit_index for bit_index, bit in enumerate(bits))
             frames.append(
                 UartFrame(
                     start_time_s=start_t,
@@ -532,12 +579,7 @@ def _decode_uart_8n1(
                     reason=reason,
                 )
             )
-            # Jump past D7 but not past the stop bit, so the loop can scan
-            # forward and find the next HIGH→LOW start edge without risk of
-            # the jump target landing exactly on (and thus skipping) the very
-            # first sample of the following start bit.  9.0× lands mid-stop-bit
-            # region, which is always safely before the next start-bit edge.
-            i = _first_index_after(logic, start_t + 9.0 * bit_time_s, start=i)
+            i = _first_index_after(logic, start_t + jump_offset * bit_time_s, start=i)
         else:
             i += 1
     return frames

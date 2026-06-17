@@ -486,6 +486,7 @@ def capture_uart_auto(
         decode_baud = detection.detected_baud
     else:
         decode_baud = 9600
+        decode_parity = "8N1"
         warnings.append("baud detection failed; falling back to 9600")
 
     # ── P4 phase-2: re-capture with optimal TDIV if baud was auto-detected ─
@@ -523,13 +524,74 @@ def capture_uart_auto(
             else:
                 notes.append("phase-2 re-trigger failed; using phase-1 data")
 
+    # ── P2b: candidate verification (decode trial) ─────────────────────────
+    # When multiple candidates exist or confidence is low/medium,
+    # try decoding with each candidate (8N1 and 8O1) and pick the best.
+    if baudrate == 0 and detection.detected_baud and detection.candidates:
+        candidates = detection.candidates
+        if len(candidates) > 1 or detection.confidence in ("low", "medium"):
+            trial_logic = [(i * dt, float(binary[i])) for i in range(len(binary))]
+            best_baud = detection.detected_baud
+            best_rate = 0.0
+            best_parity = None
+            trial_notes = []
+            for cand in candidates[:5]:  # test top 5 candidates
+                trial_baud = int(cand["baud"])
+                trial_bt = 1.0 / trial_baud
+                # Try 8N1
+                frames_8n1 = _decode_uart_8n1(trial_logic, trial_bt, idle_high=True, parity=None)
+                rate_8n1 = sum(f.stop_ok for f in frames_8n1) / len(frames_8n1) if frames_8n1 else 0.0
+                # Try 8O1
+                frames_8o1 = _decode_uart_8n1(trial_logic, trial_bt, idle_high=True, parity="odd")
+                rate_8o1 = sum(f.stop_ok for f in frames_8o1) / len(frames_8o1) if frames_8o1 else 0.0
+                # Pick best for this baud
+                if rate_8o1 > rate_8n1:
+                    trial_rate = rate_8o1
+                    parity_str = "8O1"
+                else:
+                    trial_rate = rate_8n1
+                    parity_str = "8N1"
+                trial_notes.append(f"  {trial_baud} baud {parity_str}: stop_ok={trial_rate:.1%}")
+                if trial_rate > best_rate:
+                    best_rate = trial_rate
+                    best_baud = trial_baud
+                    best_parity = parity_str
+            if best_rate < 0.1 and detection.measured_bit_time_s:
+                non_std_baud = int(round(1.0 / detection.measured_bit_time_s))
+                non_std_bt = detection.measured_bit_time_s
+                frames_8n1 = _decode_uart_8n1(trial_logic, non_std_bt, idle_high=True, parity=None)
+                rate_8n1 = sum(f.stop_ok for f in frames_8n1) / len(frames_8n1) if frames_8n1 else 0.0
+                frames_8o1 = _decode_uart_8n1(trial_logic, non_std_bt, idle_high=True, parity="odd")
+                rate_8o1 = sum(f.stop_ok for f in frames_8o1) / len(frames_8o1) if frames_8o1 else 0.0
+                if rate_8o1 > rate_8n1:
+                    non_std_rate = rate_8o1
+                    parity_str = "8O1"
+                else:
+                    non_std_rate = rate_8n1
+                    parity_str = "8N1"
+                trial_notes.append(f"  non-std {non_std_baud} baud {parity_str}: stop_ok={non_std_rate:.1%}")
+                if non_std_rate > best_rate:
+                    best_rate = non_std_rate
+                    best_baud = non_std_baud
+                    best_parity = parity_str
+                    notes.append(f"P2b: using non-standard {best_baud} baud {parity_str} (stop_ok={best_rate:.1%})")
+            if best_baud != detection.detected_baud:
+                notes.append(
+                    f"P2b verify: selected {best_baud} baud {best_parity} (stop_ok={best_rate:.1%}) "
+                    f"over detected {detection.detected_baud}"
+                )
+            notes.extend(trial_notes)
+            decode_baud = best_baud
+            decode_parity = best_parity
+
     # ── Decode ────────────────────────────────────────────────────────────
     logic = [(i * dt, binary[i]) for i in range(len(binary))]
     nominal_bt = 1.0 / decode_baud
     actual_bt = _estimate_bit_time_from_runs(logic, nominal_bt)
     measured_baud = int(round(1.0 / actual_bt))
 
-    frames = _decode_uart_8n1(logic, actual_bt, idle_high=True)
+    parity_param = "odd" if decode_parity == "8O1" else None
+    frames = _decode_uart_8n1(logic, actual_bt, idle_high=True, parity=parity_param)
     good = [f for f in frames if f.framing_ok and f.byte is not None]
     decoded_bytes = [f.byte for f in good]  # type: ignore[misc]
     decoded_hex = " ".join(f"{b:02X}" for b in decoded_bytes)
