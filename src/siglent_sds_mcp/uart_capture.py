@@ -62,7 +62,8 @@ def best_vdiv_ofst(vmax: float, vmin: float) -> tuple[float, float]:
     mid = (vmax + vmin) / 2.0
     vdiv_ideal = vpp / 6.0 if vpp > 0 else 1.0
     vdiv = next((v for v in _VDIV_STEPS_V if v >= vdiv_ideal), _VDIV_STEPS_V[-1])
-    ofst = max(-4.0 * vdiv, min(4.0 * vdiv, mid))
+    # Siglent OFST: positive shifts waveform down, so use -mid to centre
+    ofst = max(-4.0 * vdiv, min(4.0 * vdiv, -mid))
     return vdiv, ofst
 
 
